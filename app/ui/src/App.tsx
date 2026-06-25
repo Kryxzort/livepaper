@@ -86,6 +86,12 @@ export default function App() {
     document.documentElement.style.setProperty("--thumb-aspect", aspect);
   }, [s.settings?.thumbnailAspect]);
 
+  // Chrome (bars/modals/dropdowns) goes translucent ONLY when the live wallpaper is behind every tab;
+  // otherwise it's fully opaque. Drives the :root.bg-live translucency vars (--tr / --tr-strong).
+  useEffect(() => {
+    document.documentElement.classList.toggle("bg-live", !!s.settings?.wallpaperBgAllTabs);
+  }, [s.settings?.wallpaperBgAllTabs]);
+
   // Library-tab Import (parity: library action lives here, not buried in Settings).
   const onImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] as (File & { path?: string }) | undefined;

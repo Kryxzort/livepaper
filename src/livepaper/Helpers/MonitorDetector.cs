@@ -16,6 +16,8 @@ public record MonitorInfo(string Name, int RefreshHz, bool Primary)
 {
     [JsonIgnore] public int X { get; init; }
     [JsonIgnore] public int Y { get; init; }
+    [JsonIgnore] public int Width { get; init; }   // current-mode pixel size (for transition frame capture)
+    [JsonIgnore] public int Height { get; init; }
 }
 
 public static class MonitorDetector
@@ -97,7 +99,17 @@ public static class MonitorDetector
             int x = e.TryGetProperty("x", out var xe) && xe.ValueKind == JsonValueKind.Number ? xe.GetInt32() : int.MaxValue;
             int y = e.TryGetProperty("y", out var ye) && ye.ValueKind == JsonValueKind.Number ? ye.GetInt32() : int.MaxValue;
 
-            list.Add(new MonitorInfo(name, hz, primary) { X = x, Y = y });
+            // Hyprland: top-level "width"/"height" (px). Sway: "current_mode":{ width, height }.
+            int w = 0, h = 0;
+            if (e.TryGetProperty("width", out var we) && we.ValueKind == JsonValueKind.Number) w = we.GetInt32();
+            if (e.TryGetProperty("height", out var he) && he.ValueKind == JsonValueKind.Number) h = he.GetInt32();
+            if ((w == 0 || h == 0) && e.TryGetProperty("current_mode", out var cmd) && cmd.ValueKind == JsonValueKind.Object)
+            {
+                if (cmd.TryGetProperty("width", out var cw) && cw.ValueKind == JsonValueKind.Number) w = cw.GetInt32();
+                if (cmd.TryGetProperty("height", out var ch) && ch.ValueKind == JsonValueKind.Number) h = ch.GetInt32();
+            }
+
+            list.Add(new MonitorInfo(name, hz, primary) { X = x, Y = y, Width = w, Height = h });
         }
         return ResolvePrimary(list);
     }
@@ -112,12 +124,17 @@ public static class MonitorDetector
         {
             if (e.TryGetProperty("enabled", out var en) && en.ValueKind == JsonValueKind.False) continue;
             if (!e.TryGetProperty("name", out var n) || n.GetString() is not { Length: > 0 } name) continue;
-            int hz = 0;
+            int hz = 0, w = 0, h = 0;
             if (e.TryGetProperty("modes", out var modes) && modes.ValueKind == JsonValueKind.Array)
                 foreach (var m in modes.EnumerateArray())
-                    if (m.TryGetProperty("current", out var cur) && cur.ValueKind == JsonValueKind.True
-                        && m.TryGetProperty("refresh", out var rf) && rf.ValueKind == JsonValueKind.Number)
-                    { hz = (int)Math.Round(rf.GetDouble()); break; }
+                    if (m.TryGetProperty("current", out var cur) && cur.ValueKind == JsonValueKind.True)
+                    {
+                        if (m.TryGetProperty("refresh", out var rf) && rf.ValueKind == JsonValueKind.Number)
+                            hz = (int)Math.Round(rf.GetDouble());
+                        if (m.TryGetProperty("width", out var mw) && mw.ValueKind == JsonValueKind.Number) w = mw.GetInt32();
+                        if (m.TryGetProperty("height", out var mh) && mh.ValueKind == JsonValueKind.Number) h = mh.GetInt32();
+                        break;
+                    }
             if (hz <= 0) hz = 60;
             int x = int.MaxValue, y = int.MaxValue;
             if (e.TryGetProperty("position", out var pos) && pos.ValueKind == JsonValueKind.Object)
@@ -125,7 +142,7 @@ public static class MonitorDetector
                 if (pos.TryGetProperty("x", out var xe) && xe.ValueKind == JsonValueKind.Number) x = xe.GetInt32();
                 if (pos.TryGetProperty("y", out var ye) && ye.ValueKind == JsonValueKind.Number) y = ye.GetInt32();
             }
-            list.Add(new MonitorInfo(name, hz, false) { X = x, Y = y });
+            list.Add(new MonitorInfo(name, hz, false) { X = x, Y = y, Width = w, Height = h });
         }
         return ResolvePrimary(list);
     }
@@ -139,8 +156,8 @@ public static class MonitorDetector
     private static List<MonitorInfo>? ParseXrandr(string text)
     {
         var list = new List<MonitorInfo>();
-        string? name = null; bool primary = false; int x = int.MaxValue, y = int.MaxValue, hz = 0;
-        void Flush() { if (name != null) list.Add(new MonitorInfo(name, hz > 0 ? hz : 60, primary) { X = x, Y = y }); }
+        string? name = null; bool primary = false; int x = int.MaxValue, y = int.MaxValue, hz = 0, w = 0, h = 0;
+        void Flush() { if (name != null) list.Add(new MonitorInfo(name, hz > 0 ? hz : 60, primary) { X = x, Y = y, Width = w, Height = h }); }
         foreach (var line in text.Split('\n'))
         {
             var c = _xConn.Match(line);
@@ -148,6 +165,8 @@ public static class MonitorDetector
             {
                 Flush();
                 name = c.Groups[1].Value; primary = c.Groups[2].Success; hz = 0;
+                w = c.Groups[3].Success ? int.Parse(c.Groups[3].Value) : 0;
+                h = c.Groups[4].Success ? int.Parse(c.Groups[4].Value) : 0;
                 x = c.Groups[5].Success ? int.Parse(c.Groups[5].Value) : int.MaxValue;
                 y = c.Groups[6].Success ? int.Parse(c.Groups[6].Value) : int.MaxValue;
                 continue;

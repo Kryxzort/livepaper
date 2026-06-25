@@ -8,9 +8,11 @@
 - `.NET 10 SDK` — build the backend; `Node.js` / `npm` — build the React UI + run the Electron shell
 - Wayland compositor (Hyprland, Sway, GNOME on Wayland)
 - `pactl` / `parec` (libpulse) — Auto-Mute stream detection (+ live LWE scene volume via `pactl`)
-- `ffmpeg` — thumbnail extraction (Import) + frozen-frame grabs
+- `ffmpeg` — thumbnail extraction (Import) + frozen-frame grabs + transition frame capture (→ raw RGBA)
 - `wl-clipboard` — `wl-copy` for keybind Copy buttons (renderer uses `navigator.clipboard`, falls back to `wl-copy`)
 - `linux-wallpaperengine` *(optional)* — WE **scene** support (Settings → "Allow scene support")
+- `grim` — captures the live scene frame for transitions
+- *(build-time, optional)* `cc` + `wayland-scanner` + wayland/EGL/GLES dev headers — build `lp-transition` (transition renderer); absent → transitions no-op (instant cut)
 
 ## Common Commands
 
@@ -52,12 +54,16 @@ src/livepaper/            # headless C# backend (CLI + daemons + --serve API). N
 ├── Scrapers/             # MotionBgsScraper, MoewallsScraper, DesktophutScraper, WallpaperEngineScraper (static HTTP+HTML)
 ├── Services/             # IBgsProvider + one service per source; SteamWorkshopService
 ├── Helpers/              # PlayerHelper, DownloadHelper, LibraryService, LibraryStore, ImportService,
-│                         #   SettingsService, AudioMonitor, MonitorDetector, WorkshopDownloader, WorkshopUnsubQueue
+│                         #   SettingsService, AudioMonitor, MonitorDetector, TransitionService, WorkshopDownloader, WorkshopUnsubQueue
 └── Web/                  # ServerHost (minimal-API endpoints), AppOps (orchestration), EventBus (WS), SteamOps
+src/native/lp-transition/ # C: wlr-layer-shell + EGL/GLES transition renderer (built by install.sh)
+transitions/             # shared GLSL effect catalog (glsl/ + manifest.json + wrap.* + preview/) — UI previews + the renderer
 app/
 ├── ui/                   # Vite + React 19 + TS + zustand + framer-motion (the renderer)
 └── shell/                # Electron main/preload + probes; spawns `livepaper --serve`, loads the UI same-origin
 ```
+
+WE-style **transitions** animate every wallpaper switch (gl-transitions GLSL) — see `.claude/rules/player.md`. v1: video→video, **full-live** (both sides keep playing through the effect — libmpv decodes A+B in the renderer; frozen stills are the warmup/scene fallback).
 
 The Avalonia UI (`Views/`, `ViewModels/`, `App.axaml`) was **removed** in the Electron rewrite — don't reference it. `Web/` only wraps the unchanged scrapers/helpers/daemons; UI lives in `app/`. See `.claude/rules/web-backend.md` + `web-ui.md`.
 

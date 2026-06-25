@@ -967,6 +967,30 @@ public static class PlayerHelper
         bool nextIsScene = IsScenePath(path);
         bool prevIsScene = IsLweRunning;
 
+        // ── WE-style transition (freeze A → animate to B's first frame) ───────
+        // v1 fires only for video→video (seamless: B loads paused under the opaque overlay, the
+        // renderer unpauses it at teardown). Scene-involved switches keep the existing pre-launch.
+        // Captured here while A is still playing; the overlay then hides the loadfile underneath.
+        // Only when the seamless IPC swap below will actually run. If the cold path would run (mpv
+        // dead / deferred leak-restart), B takes ~2s to appear and would gap before the brief overlay
+        // ends — so skip the transition and just instant-cut.
+        bool transitioning = false;
+        bool mpvAliveForTransition = File.Exists(IpcSocket) && Process.GetProcessesByName("mpvpaper").Length > 0;
+        if (!nextIsScene && !prevIsScene && IsPlaying && mpvAliveForTransition && !_restartPending)
+        {
+            var tcfg = TransitionService.CurrentConfig();
+            if (tcfg.Enabled)
+            {
+                var fromPath = QueryCurrentPath();
+                // full-live: the overlay decodes A (from its live position) AND B (from 0) so both
+                // sides keep playing through the effect. mpvpaper loads B PAUSED at frame 0 under the
+                // opaque overlay (pauseAtStart below); at teardown the renderer seeks that B to the
+                // overlay's exact position and unpauses it → frame-accurate reveal, no backward jump.
+                if (!string.IsNullOrEmpty(fromPath) && fromPath != path)
+                    transitioning = TransitionService.TryStart(fromPath, false, path, false, tcfg);
+            }
+        }
+
         // ── Transition involving a scene ──────────────────────────────────────
         if (nextIsScene || prevIsScene)
         {
@@ -1087,7 +1111,7 @@ public static class PlayerHelper
         var cfg = SettingsService.Load();
         int effVol = ReadVolumeOverride(path) ?? cfg.Volume;
         double effSpd = ReadSpeedOverride(path) ?? cfg.Speed;
-        if (mpvAlive && !_restartPending && TryIpcSwitchToFile(path, effVol, effSpd))
+        if (mpvAlive && !_restartPending && TryIpcSwitchToFile(path, effVol, effSpd, pauseAtStart: transitioning))
         {
             _currentSpeed = effSpd; // keep the timed-tick speed factor in sync (cold path sets it below)
             OnWallpaperChanged?.Invoke(path);
@@ -1109,7 +1133,7 @@ public static class PlayerHelper
         OnWallpaperChanged?.Invoke(path);
     }
 
-    private static bool TryIpcSwitchToFile(string path, int volume, double speed)
+    private static bool TryIpcSwitchToFile(string path, int volume, double speed, bool pauseAtStart = false)
     {
         // Read AppSettings.Loop directly so the loop state is explicit rather
         // than parsed out of the kill+launch options string. Other launch-only
@@ -1120,6 +1144,9 @@ public static class PlayerHelper
         // Carries the effective volume/speed (+ mute) so the new file starts at them — no post-load reset race.
         var fileOpts = $"volume={volume},speed={speed.ToString("G", System.Globalization.CultureInfo.InvariantCulture)}";
         if (_isMuted) fileOpts += ",mute=yes";
+        // Transition handoff: load B paused at frame 0 (hidden under the opaque overlay); the
+        // lp-transition renderer unpauses it (--mpv-unpause) the instant it tears down → seamless.
+        if (pauseAtStart) fileOpts += ",pause=yes";
         return TrySendCommand("set", "loop-file", loopFile ? "inf" : "no")
             && TrySendCommand("set", "loop-playlist", "no")
             && TrySendCommand("playlist-clear")
@@ -1515,6 +1542,38 @@ public static class PlayerHelper
 
     // Public accessor for the web UI (sync the in-app wallpaper preview to live mpv position).
     public static double? QueryTimePos() => TryQueryTimePos();
+
+    // Current video's total length (for the transition: wrap A's advanced start on looping videos).
+    public static double? QueryDuration() => TryQueryProperty("duration");
+
+    private static double? TryQueryProperty(string prop)
+    {
+        var socketPath = IpcSocket;
+        if (!File.Exists(socketPath)) return null;
+        try
+        {
+            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            socket.SendTimeout = 500;
+            socket.ReceiveTimeout = 500;
+            socket.Connect(new UnixDomainSocketEndPoint(socketPath));
+            var cmd = JsonSerializer.Serialize(new { command = new object[] { "get_property", prop } });
+            socket.Send(Encoding.UTF8.GetBytes(cmd + "\n"));
+            var buf = new byte[4096];
+            int n = socket.Receive(buf);
+            foreach (var line in Encoding.UTF8.GetString(buf, 0, n).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Number)
+                        return data.GetDouble();
+                }
+                catch { }
+            }
+            return null;
+        }
+        catch { return null; }
+    }
 
     private static double? TryQueryTimePos()
     {

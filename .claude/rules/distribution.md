@@ -18,7 +18,7 @@ The app ships as **two pieces**: a published self-contained C# backend + the bui
    - **`livepaper-ui`** — runs Electron on `app/shell` (sets `LP_BACKEND` + `LP_UI_DIR`).
 5. Writes `~/.local/share/applications/livepaper.desktop` (Exec=`livepaper-ui`).
 
-**Electron is `app/shell/node_modules/electron`** (decoupled from `demos/`). On this machine npm blocks install scripts, so the binary was seeded from `demos/shell`'s copy (same 33.4.11). install.sh keeps a `demos/shell` electron fallback as a safety; `demos/` stays (untracked) but isn't a dependency.
+**Electron is `app/shell/node_modules/electron`** (version pinned in `app/shell/package.json`, currently **42.5.0** — older Electron's Chromium crash-loops the GPU process on NVIDIA + kernel ≥6.12, see `freeze-diagnostics`). `app/shell/package.json` has an `allowScripts` allowlist keyed to the exact version so Electron's binary-download postinstall runs (bump it when bumping Electron). `install.sh` aborts if the binary is missing — no `demos/` fallback (`demos/` is gitignored/local-only, absent on a clone).
 
 ### ⚠️ Stale / not-yet-rebuilt packaging
 - **`scripts/build-appimage.sh`** and **`scripts/PKGBUILD`** still build the **pre-rewrite single-binary Avalonia app** (PKGBUILD has no `nodejs`/`electron` deps and points at the old upstream repo). They do **not** produce the current Electron+backend stack — treat as broken until rewritten.

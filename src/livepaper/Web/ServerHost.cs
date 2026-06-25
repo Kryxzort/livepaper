@@ -378,6 +378,18 @@ public static class ServerHost
             return Results.Json(item);
         });
 
+        // ---- transitions ------------------------------------------------------------------
+        // The effect catalog (id, name, category, defaultOn, uniforms) for the picker UI.
+        app.MapGet("/transitions", () => Results.Json(TransitionService.Manifest()));
+        // Live-preview assets: the composed fragment per effect + the shared vertex shader + two
+        // sample frames. The UI compiles the SAME source the native renderer does (WYSIWYG previews).
+        app.MapGet("/transitions/frag/{id}", (string id) =>
+            TransitionService.ComposedFragment(id) is { } f ? Results.Text(f, "text/plain") : Results.NotFound());
+        app.MapGet("/transitions/vert", () =>
+            TransitionService.VertSource() is { } v ? Results.Text(v, "text/plain") : Results.NotFound());
+        app.MapGet("/transitions/preview/{which}", (string which) =>
+            TransitionService.PreviewImagePath(which) is { } p ? Results.File(p, "image/jpeg") : Results.NotFound());
+
         // ---- playlist ---------------------------------------------------------------------
         app.MapGet("/playlist/state", () => Results.Json(PlaylistService.LoadCurrentState()));
         app.MapPost("/playlist/state", (CustomPlaylist p) => { PlaylistService.SaveCurrentState(p); return Results.Ok(); });

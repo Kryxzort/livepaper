@@ -1,5 +1,8 @@
+import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import { Sparkles } from "lucide-react";
 import type { PlaylistSettings } from "../api/client";
+import { TransitionPicker } from "./TransitionPicker";
 
 // Playlist Settings overlay. Centered modal:
 // order (Sequential/Shuffle), auto-add-new-library-items (global), override-global, and (when
@@ -14,6 +17,8 @@ export function PlaylistSettingsModal({
   const H = Math.floor(iv / 3600), M = Math.floor((iv % 3600) / 60), S = iv % 60;
   const setIv = (h: number, m: number, s: number) => setPS({ intervalSeconds: h * 3600 + m * 60 + s });
   const ovr = ps.overrideGlobalSettings;
+  const [picker, setPicker] = useState(false);
+  const trN = ps.transitionEffectIds?.length ?? 0;
   return (
     <AnimatePresence>
       {open && (
@@ -42,7 +47,16 @@ export function PlaylistSettingsModal({
                   <input className="num" type="number" min={0} max={59} disabled={!ovr} value={M} onChange={(e) => setIv(H, +e.target.value, S)} /><span>m</span>
                   <input className="num" type="number" min={0} max={59} disabled={!ovr} value={S} onChange={(e) => setIv(H, M, +e.target.value)} /><span>s</span>
                 </div>
+
+                <div className="field-label">TRANSITIONS</div>
+                <button className="btn ghost ico tr-open" disabled={!ovr} onClick={() => setPicker(true)}>
+                  <Sparkles size={15} />
+                  {ps.transitionEnabled ? `On · ${trN} effect${trN === 1 ? "" : "s"}` : "Off"}
+                </button>
               </div>
+
+              <TransitionPicker open={picker} value={ps} onChange={setPS} onClose={() => setPicker(false)}
+                title="Playlist Transitions" />
 
               <div className="modal-actions"><button className="btn ghost" onClick={onClose}>Close</button></div>
             </div>

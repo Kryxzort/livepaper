@@ -85,6 +85,14 @@ export interface LibraryItem {
 export interface PlaylistSettings {
   order: 0 | 1; overrideGlobalSettings: boolean; intervalSeconds: number;
   advanceOnVideoEnd: boolean; waitForVideoEnd: boolean;
+  // WE-style transitions (gated by overrideGlobalSettings; else the globalTransition* fallbacks).
+  transitionEnabled: boolean; transitionEffectIds: string[];
+  transitionDurationMs: number; transitionDurationMaxMs: number; transitionShuffle: boolean;
+}
+export interface TransitionUniform { name: string; type: string; default: number[] | null }
+export interface TransitionEffect {
+  id: string; name: string; category: string; defaultOn: boolean;
+  author: string; license: string; uniforms: TransitionUniform[] | null;
 }
 export interface CustomPlaylist { videoPaths: string[]; settings: PlaylistSettings; name: string | null; }
 export interface Theme {
@@ -122,6 +130,12 @@ export const api = {
   download: (source: number, result: Wallpaper, apply: boolean, signal?: AbortSignal) =>
     jpost<LibraryItem & { error?: string }>("/download", { source, result, apply }, signal),
   steamcmdSignin: () => jpost("/steam/steamcmd-signin"),
+  transitions: () => jget<TransitionEffect[]>("/transitions"),
+  // cache-bust frag/vert: the GLSL is regenerated during dev, and a stale Electron HTTP-cache
+  // entry would replay an old (possibly broken) shader. Tiny text, fetched once per picker open.
+  transitionFragUrl: (id: string) => `${API}/transitions/frag/${encodeURIComponent(id)}?t=${Date.now()}`,
+  transitionVertUrl: () => `${API}/transitions/vert?t=${Date.now()}`,
+  transitionPreviewUrl: (which: "a" | "b") => `${API}/transitions/preview/${which}`,
   playlistState: () => jget<CustomPlaylist | null>("/playlist/state"),
   savePlaylistState: (p: CustomPlaylist) => jpost("/playlist/state", p),
   playlistNames: () => jget<string[]>("/playlist/names"),

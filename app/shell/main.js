@@ -20,6 +20,23 @@ const VITE = "http://localhost:5173";
 // (override with LP_OZONE=wayland to try native again.)
 app.commandLine.appendSwitch("ozone-platform-hint", process.env.LP_OZONE || "x11");
 
+// (Opt-in only) ANGLE backend override. The default GL backend crash-loops the GPU process on some
+// NVIDIA stacks (eglCreateImage 0x3009 / OzoneImageBacking) which kills WebGL — but forcing Vulkan
+// can break window compositing (black/transparent flicker). So it stays OFF unless explicitly asked.
+const angle = process.env.LP_ANGLE;
+if (angle) {
+  app.commandLine.appendSwitch("use-angle", angle);
+  if (angle === "vulkan") app.commandLine.appendSwitch("enable-features", "Vulkan");
+}
+
+// (Opt-in) Software GL. On stacks where the hardware GPU process crash-loops (eglCreateImage),
+// hardware WebGL is unavailable/slow to warm up → transition previews lag. SwiftShader renders the
+// whole renderer on CPU: stable window + instant WebGL, at the cost of CPU-composited UI.
+if (process.env.LP_SOFTGL) {
+  app.commandLine.appendSwitch("disable-gpu");
+  app.commandLine.appendSwitch("enable-unsafe-swiftshader");
+}
+
 let backend;
 function startBackend() {
   try { fs.unlinkSync(portFile); } catch { /* fresh */ }
@@ -74,7 +91,10 @@ function openWindow(loadUrl) {
   win.loadURL(loadUrl);
 }
 
-const DBG = process.env.LP_DEBUG ? "debug" : ""; // LP_DEBUG=1 → on-screen FPS/metrics HUD + lpdbg bridge
+// LP_DEBUG=1 → ?debug → the lpdbg control bridge + perf-metrics tracking (fetch via lpdbg.metrics()).
+// It does NOT show the on-screen HUD: the visual overlay is gated to the Settings "Show debug overlay"
+// toggle only (see DebugHud overlayOn) — bridge mode keeps the values accessible without painting them.
+const DBG = process.env.LP_DEBUG ? "debug" : "";
 // LP_DEBUG opens a CDP remote-debugging port so tooling can attach to the live window.
 if (process.env.LP_DEBUG) app.commandLine.appendSwitch("remote-debugging-port", "9222");
 

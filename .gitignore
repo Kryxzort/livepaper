@@ -12,3 +12,8 @@ scripts/src/
 scripts/pkg/
 scripts/livepaper-git/
 *.AppImage
+# lp-transition: built binary + wayland-scanner-generated protocol glue
+src/native/lp-transition/lp-transition
+src/native/lp-transition/*-protocol.c
+src/native/lp-transition/*-protocol.h
+scripts/gl-transitions/

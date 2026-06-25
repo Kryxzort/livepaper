@@ -1,12 +1,13 @@
 import { memo, useEffect, useRef, useState } from "react";
 import {
   FolderOpen, X, RotateCcw, SlidersHorizontal, Repeat, VolumeX, Cpu, Palette,
-  Layers, MonitorSmartphone, Download, Terminal, Keyboard, Library as LibraryIcon, Wrench,
+  Layers, MonitorSmartphone, Download, Terminal, Keyboard, Library as LibraryIcon, Wrench, Sparkles,
 } from "lucide-react";
 import { useStore, SETTINGS_DEFAULTS } from "../store";
 import { api } from "../api/client";
 import { useSmoothScroll } from "../hooks/useSmoothScroll";
 import { Select } from "../components/Select";
+import { TransitionPicker, type TransitionValue } from "../components/TransitionPicker";
 
 // Electron preload (app/shell/preload.js) exposes native dialogs; null in a browser → text entry only.
 const lp = (window as unknown as { lp?: { pickFolder?: () => Promise<string | null>; pickFile?: () => Promise<string | null> } }).lp;
@@ -127,6 +128,20 @@ export const Settings = memo(function Settings() {
   const actions = ["toggle-mute", "toggle-pause", "stop", "play", "toggle-play",
     "next-wallpaper", "previous-wallpaper", "random", "volume-up", "volume-down"];
 
+  // Global transition config (the fallback used when a playlist doesn't override). The picker speaks
+  // the per-playlist field names, so adapt to/from the global* keys.
+  const [trPicker, setTrPicker] = useState(false);
+  const trVal: TransitionValue = {
+    transitionEnabled: g("globalTransitionEnabled", false),
+    transitionEffectIds: g<string[]>("globalTransitionEffectIds", []),
+    transitionDurationMs: g("globalTransitionDurationMs", 600),
+    transitionDurationMaxMs: g("globalTransitionDurationMaxMs", 0),
+    transitionShuffle: g("globalTransitionShuffle", true),
+  };
+  const trChange = (p: Partial<TransitionValue>) => {
+    for (const [k, v] of Object.entries(p)) set("global" + k[0].toUpperCase() + k.slice(1), v as never);
+  };
+
   return (
     <div className="scroll settings" ref={scrollRef}>
       <Section title="Playback" icon={<SlidersHorizontal size={15} />}>
@@ -152,7 +167,12 @@ export const Settings = memo(function Settings() {
           </div>
         </Row>
         <Row label="Auto-add new library items to playlist" rk="autoAddLibraryToPlaylist"><input type="checkbox" checked={g("autoAddLibraryToPlaylist", false)} onChange={(e) => set("autoAddLibraryToPlaylist", e.target.checked)} /></Row>
+        <Row label="Transitions" hint="animated effect between wallpaper switches" rk="globalTransitionEnabled">
+          <button className="btn ghost ico" onClick={() => setTrPicker(true)}><Sparkles size={14} />
+            {trVal.transitionEnabled ? `On · ${trVal.transitionEffectIds.length}` : "Off"}</button>
+        </Row>
       </Section>
+      <TransitionPicker open={trPicker} value={trVal} onChange={trChange} onClose={() => setTrPicker(false)} title="Global Transitions" />
 
       <Section title="Auto-Mute" icon={<VolumeX size={15} />}>
         <Row label="Mute when system audio plays" rk="autoMute"><input type="checkbox" checked={am} onChange={(e) => set("autoMute", e.target.checked)} /></Row>

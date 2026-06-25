@@ -62,6 +62,14 @@ public class AppSettings
     }
     public bool GlobalWaitForVideoEnd { get; set; } = false;
     public bool PlaylistWaitForVideoEnd { get; set; } = false;
+
+    // Global transition fallbacks (used when a playlist's OverrideGlobalSettings is off). See
+    // PlaylistSettings.Transition* + TransitionService. Empty/!Enabled => instant cut.
+    public bool GlobalTransitionEnabled { get; set; } = false;
+    public List<string> GlobalTransitionEffectIds { get; set; } = [];
+    public int GlobalTransitionDurationMs { get; set; } = 600;
+    public int GlobalTransitionDurationMaxMs { get; set; } = 0;
+    public bool GlobalTransitionShuffle { get; set; } = true;
     public bool AutoAddLibraryToPlaylist { get; set; } = false;
     public bool AutoImportWallpaperEngine { get; set; } = false;
     public bool IsPlaylistCollapsed { get; set; } = false;

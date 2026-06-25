@@ -1,0 +1,12 @@
+vec4 transition (vec2 uv) {
+
+  vec4 coordTo = getToColor(uv);
+  vec4 coordFrom = getFromColor(uv);
+
+  return mix(
+    getFromColor(mix(uv, coordTo.rg, progress)),
+    getToColor(mix(coordFrom.rg, uv, progress)),
+    progress
+  );
+
+}
