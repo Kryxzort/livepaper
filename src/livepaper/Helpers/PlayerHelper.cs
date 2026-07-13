@@ -52,7 +52,7 @@ public static class PlayerHelper
     public static CancellationToken DaemonToken => _daemonCts?.Token ?? CancellationToken.None;
 
     public static bool IsPlaying =>
-        (File.Exists(IpcSocket) && Process.GetProcessesByName("mpvpaper").Length > 0) ||
+        (File.Exists(IpcSocket) && MpvpaperProcs().Length > 0) ||
         IsLweRunning;
 
     private static bool IsLweRunning
@@ -143,6 +143,92 @@ public static class PlayerHelper
     private static string IpcSocket => Path.Combine(
         Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR") ?? Path.GetTempPath(),
         "livepaper", "mpv.sock");
+
+    // Control socket for a running full-live transition overlay (lp-transition binds it). Lets a keybind
+    // during the effect reach the overlay's OWN audio (it decodes A/B itself; mpvpaper isn't audible then).
+    private static string OverlayCtlSocket => Path.Combine(
+        Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR") ?? Path.GetTempPath(),
+        "livepaper", "lp-transition.ctl");
+
+    // Best-effort live command (mute/volume) to a transition overlay if one is listening (DGRAM, no-op
+    // otherwise). So toggle-mute / volume± mid-effect take hold immediately instead of post-teardown.
+    private static void SendOverlayCtl(string cmd)
+    {
+        try
+        {
+            if (!File.Exists(OverlayCtlSocket)) return;
+            using var s = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.Unix,
+                System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Unspecified);
+            s.SendTo(System.Text.Encoding.UTF8.GetBytes(cmd), new System.Net.Sockets.UnixDomainSocketEndPoint(OverlayCtlSocket));
+        }
+        catch { }
+    }
+
+    // ── lp-audio: libpulse helper for gapless scene-audio crossfades ───────────────────────────────
+    // A persistent process holding a PulseAudio context that applies per-PID sink-input volume/mute
+    // IN-PROCESS on every stream new/change event — so a stream PA (re)creates at the wrong volume
+    // (default-on-create / LWE connect-disconnect reset) is corrected in ~1ms, which shelling `pactl`
+    // (~10-40ms) can't. Driven over stdin: "set <pidcsv> <vol> <mute>", "clear", "quit".
+    private static Process? _lpAudio;
+    private static readonly object _lpAudioLock = new();
+
+    private static string? ResolveLpAudioBin()
+    {
+        var env = Environment.GetEnvironmentVariable("LP_AUDIO_BIN");
+        if (env != null && File.Exists(env)) return env;
+        foreach (var c in new[] {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "lp-audio"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "native", "lp-audio", "lp-audio"),
+            Path.Combine(Directory.GetCurrentDirectory(), "src", "native", "lp-audio", "lp-audio") })
+            try { var f = Path.GetFullPath(c); if (File.Exists(f)) return f; } catch { }
+        return null;
+    }
+
+    // Send one command to the persistent lp-audio (spawned lazily, respawned if dead). No-op if the
+    // helper isn't built (→ scene audio just isn't crossfaded, falls back to the plain switch).
+    private static void AudioCtl(string line)
+    {
+        try
+        {
+            lock (_lpAudioLock)
+            {
+                if (_lpAudio == null || _lpAudio.HasExited)
+                {
+                    var bin = ResolveLpAudioBin();
+                    if (bin == null) { TransitionService.TransLog($"AudioCtl: NO lp-audio binary found"); return; }
+                    var psi = new ProcessStartInfo(bin) { UseShellExecute = false, RedirectStandardInput = true };
+                    _lpAudio = Process.Start(psi);
+                }
+                _lpAudio?.StandardInput.WriteLine(line);
+                _lpAudio?.StandardInput.Flush();
+            }
+        }
+        catch { try { lock (_lpAudioLock) { _lpAudio = null; } } catch { } }
+    }
+    private static string PidCsv(IEnumerable<int> pids) => string.Join(",", pids);
+
+    // PulseAudio stream-restore continuously saves the linux-wallpaperengine app volume, so a transient
+    // crossfade value (e.g. 25% mid-fade, or 0% at fade-out) gets remembered and poisons the NEXT fresh
+    // scene launch (first playlist item / --restore / --random) — which has no crossfade to set the right
+    // level → it comes up silent/quiet. LWE forces its own application.name and pipewire ignores
+    // module-stream-restore.id, so we can't change the restore key. Instead, correct reactively: hold the
+    // just-launched scene at `target` via lp-audio (event-driven → overrides the restored value the instant
+    // the stream appears) for ~holdMs, then release so manual volume control governs the steady state.
+    private static void CorrectSceneVolume(HashSet<int> beforePids, int target, bool muted, int holdMs)
+    {
+        _ = Task.Run(async () =>
+        {
+            int m = muted ? 1 : 0, steps = Math.Max(4, holdMs / 250);
+            AudioCtl("clear");
+            for (int k = 0; k < steps; k++)
+            {
+                var np = GetLweProcPids(); np.ExceptWith(beforePids);   // the newly-launched scene's pids
+                if (np.Count > 0) AudioCtl($"set {PidCsv(np)} {target} {m}");
+                try { await Task.Delay(250); } catch { break; }
+            }
+            AudioCtl("clear");
+        });
+    }
 
     private static string TimedStatePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -848,6 +934,7 @@ public static class PlayerHelper
                 _history != null && _historyIndex >= 0 && _historyIndex < _history.Count &&
                 IsScenePath(_history[_historyIndex]) && !IsSkippedPath(_history[_historyIndex]) && !IsLweRunning)
             {
+                TransitionService.TransLog($"TICK scene-crash advance: idx={_historyIndex} item={System.IO.Path.GetFileName(_history[_historyIndex])} IsLweRunning=false");
                 OnSceneCrashed?.Invoke(_history[_historyIndex]);
                 _timedRemainingMs = 0;
                 // Kill orphaned LWE immediately — the advance may go through DoVideoEndWait
@@ -899,6 +986,33 @@ public static class PlayerHelper
                 // correct: 15 real minutes = 30 minutes of video content. Scenes run at 1x.
                 var speedFactor = IsLweRunning ? 1.0 : _currentSpeed;
                 _timedRemainingMs -= (long)(elapsedMs * speedFactor);
+            }
+
+            // Video→scene LEAD (pure timed mode): a scene needs SceneTransitionDelayMs to load behind
+            // the cover, so fire the switch that many ms EARLY — the live video keeps playing under the
+            // overlay during the load and the scene reveals right at the interval boundary (mirrors the
+            // video-end lead in DoVideoEndWait). Only V→S with a transition enabled; the reset-to-full
+            // in LaunchAndReset prevents a re-fire. Skipped for advance-on-end / wait modes (those lead
+            // via DoVideoEndWait) and for intervals shorter than the lead.
+            // Gate on the wait MODE flags (_waitForVideoEnd / _advanceOnVideoEnd), not just the transient
+            // _waitingForVideoEnd — between switches that transient is false, so without this the lead
+            // fired off the INTERVAL in wait-for-video-end mode (premature V→S) instead of off the video end.
+            if (!_advanceOnVideoEnd && !_waitForVideoEnd && !_waitingForVideoEnd && _timedInterval > TimeSpan.Zero)
+            {
+                int leadMs = SettingsService.Load().SceneTransitionDelayMs;
+                if (leadMs > 0 && _timedRemainingMs <= leadMs && _timedRemainingMs > 0
+                    && _timedInterval.TotalMilliseconds > leadMs)
+                {
+                    var cur = _history != null && _historyIndex >= 0 && _historyIndex < _history.Count ? _history[_historyIndex] : null;
+                    var nxt = PeekNextTimed();
+                    if (cur != null && !IsScenePath(cur) && nxt != null && IsScenePath(nxt)
+                        && SettingsService.Load().AllowScenes && TransitionService.CurrentConfig().Enabled)
+                    {
+                        AdvanceAndLaunch();
+                        _playlistTimer?.Change(TickInterval, Timeout.InfiniteTimeSpan);
+                        return;
+                    }
+                }
             }
 
             // _timedInterval > Zero prevents spurious expiry in pure advance-on-end mode
@@ -974,20 +1088,19 @@ public static class PlayerHelper
         // Only when the seamless IPC swap below will actually run. If the cold path would run (mpv
         // dead / deferred leak-restart), B takes ~2s to appear and would gap before the brief overlay
         // ends — so skip the transition and just instant-cut.
-        bool transitioning = false;
-        bool mpvAliveForTransition = File.Exists(IpcSocket) && Process.GetProcessesByName("mpvpaper").Length > 0;
+        bool transitionPauseB = false; // method-dependent: reveal=false (B live), frozen/full-live=true (B paused, renderer unpauses)
+        bool mpvAliveForTransition = File.Exists(IpcSocket) && MpvpaperProcs().Length > 0;
         if (!nextIsScene && !prevIsScene && IsPlaying && mpvAliveForTransition && !_restartPending)
         {
             var tcfg = TransitionService.CurrentConfig();
             if (tcfg.Enabled)
             {
                 var fromPath = QueryCurrentPath();
-                // full-live: the overlay decodes A (from its live position) AND B (from 0) so both
-                // sides keep playing through the effect. mpvpaper loads B PAUSED at frame 0 under the
-                // opaque overlay (pauseAtStart below); at teardown the renderer seeks that B to the
-                // overlay's exact position and unpauses it → frame-accurate reveal, no backward jump.
+                // The overlay covers (frozen A / live decode) before we switch B underneath; whether B
+                // is loaded paused or live depends on the chosen method (TryStart resolves it + reports
+                // pauseB). reveal = B plays live underneath; frozen/full-live = B paused, renderer unpauses.
                 if (!string.IsNullOrEmpty(fromPath) && fromPath != path)
-                    transitioning = TransitionService.TryStart(fromPath, false, path, false, tcfg);
+                    TransitionService.TryStart(fromPath, false, path, false, tcfg, out transitionPauseB);
             }
         }
 
@@ -997,6 +1110,30 @@ public static class PlayerHelper
             // a scene swap tears mpvpaper down (→ leak reset) and "zeroes" the restart timer — any
             // deferred restart is satisfied by the teardown; clear it + reset the in-process countdown.
             if (_restartPending) { _restartPending = false; if (!_daemonMode) UpdateRestartTimer(); }
+
+            // ── WE-style transition for a scene-involved switch ───────────────────────────────────
+            // Cover A first (grim still if A is a scene, ffmpeg/live-decode if video), THEN the
+            // crossover below launches B UNDERNEATH the opaque overlay (hidden) → the renderer reveals
+            // it. This hides the LWE launch flash / the mpvpaper↔LWE swap. TryStart resolves the method
+            // (auto-fallback: full-live A=scene→reveal, frozen B=scene→reveal, V→S full-live→reveal-b)
+            // and blocks until the overlay covers, so B is launched only once A is hidden.
+            bool scenePauseB = false; // frozen S→V: launch mpvpaper-B paused at frame0; renderer unpauses at teardown
+            bool transitionActive = false; // did the visual transition actually fire → gate the audio crossfade to match
+            if (IsPlaying)
+            {
+                var tcfg = TransitionService.CurrentConfig();
+                // QueryCurrentPath() reads the OLD video from mpv, but for a scene A the playlist history
+                // has already advanced to the target → it returns `path`. grim captures the on-screen
+                // scene regardless of its path, so use a sentinel for a scene A and only enforce the
+                // "different file" guard (skip same-wallpaper switches) for a video A.
+                var fromPath = prevIsScene ? "scene" : QueryCurrentPath();
+                if (tcfg.Enabled && !string.IsNullOrEmpty(fromPath) && (prevIsScene || fromPath != path))
+                {
+                    TransitionService.TryStart(fromPath, prevIsScene, path, nextIsScene, tcfg, out scenePauseB);
+                    transitionActive = true;
+                }
+            }
+
             if (nextIsScene)
             {
                 var settings = SettingsService.Load();
@@ -1012,38 +1149,91 @@ public static class PlayerHelper
                 string lweArg = loc?.Source == LibraryStore.Local ? loc.Value.Key : path;
 
                 // Capture old processes before launching new ones.
-                var oldMpvProcs = Process.GetProcessesByName("mpvpaper");
+                var oldMpvProcs = MpvpaperProcs();
                 var oldLwePids = ReadCurrentLwePids();
+                // Snapshot the OUTGOING scene's PROCESS PIDs (real, from pgrep) before launching B. The PID
+                // is stable per LWE process even when LWE re-registers its client / re-creates its stream,
+                // so it reliably separates old from new (client.id and sink-input # churn; the PID doesn't),
+                // and pgrep — unlike the client map — never transiently drops a process mid-registration.
+                var oldPids = GetLweProcPids();
 
-                // Launch new LWE without killing old yet.
-                var newPids = SpawnLweProcesses(lweArg, settings);
+                int targetVol = ReadVolumeOverride(path) ?? settings.Volume;
+                var newPids = SpawnLweProcesses(lweArg, settings, targetVol);
                 OnWallpaperChanged?.Invoke(path);
-
-                if (newPids.Length > 0)
-                {
-                    var volOverride = ReadVolumeOverride(path);
-                    var count = newPids.Length;
-                    _ = Task.Run(async () =>
-                    {
-                        for (int i = 0; i < 60; i++)
-                        {
-                            if (GetLweSinkInputIds().Count >= count) break;
-                            await Task.Delay(50);
-                        }
-                        ApplyLweMute(_isMuted || AudioMonitor.IsMuted);
-                        ApplyLweVolume(volOverride ?? settings.Volume);
-                    });
-                }
 
                 var capturedLwePids = oldLwePids;
                 _prelaunchPidsToKill = capturedLwePids;
                 var cts = _prelaunchCts = new CancellationTokenSource();
-                var delayMs = settings.SceneTransitionDelayMs;
                 var capturedMpv = oldMpvProcs;
+                bool oldIsMpv = capturedMpv.Length > 0;       // V→S: fade the outgoing VIDEO via mpv IPC; S→S: fade old LWE by client.id
+                bool hasOld = oldIsMpv || prevIsScene;         // false = FIRST wallpaper (nothing to crossfade) → no fade-in
+                bool muted0 = _isMuted || AudioMonitor.IsMuted || settings.NoAudio;
+                int fadeMs = Math.Clamp(TransitionService.CurrentConfig().DurationMs, 200, 8000);
+                int coverMs = Math.Clamp(settings.SceneTransitionDelayMs, 0, 8000);
+                int oldMuteI = muted0 ? 1 : 0;
                 _ = Task.Run(async () =>
                 {
-                    try { await Task.Delay(delayMs, cts.Token); }
-                    catch { return; }
+                    // the new scene's PID(s) = LWE processes that appeared after the launch (≠ the old set)
+                    HashSet<int> NewPids() { var p = GetLweProcPids(); p.ExceptWith(oldPids); return p; }
+                    // lp-audio holds these targets event-driven (instant on any stream create/reset). We only
+                    // push the ramp values over stdin; the helper keeps them glued across LWE's re-inits.
+                    string oldCsv = PidCsv(oldPids);
+                    var newScenePids = new HashSet<int>();
+                    try
+                    {
+                        // Crossfade ONLY when a visual transition is active. Transitions off → instant cut:
+                        // new is already launched at target, just wait the load delay, then reap (no lp-audio).
+                        if (transitionActive && newPids.Length > 0)
+                        {
+                            // Wipe any stale lp-audio groups FIRST — a prior transition's `clear` tail can be
+                            // cancelled by this advance, and Linux REUSES PIDs, so a lingering "[dead pid]→0"
+                            // group can pin a freshly-launched scene at 0 forever. Clearing at the START of
+                            // every transition guarantees a clean slate (no accumulation, no PID-reuse poison).
+                            AudioCtl("clear");
+                            // PHASE 1 — cover: new muted+0, old held at target (lp-audio applies on stream events).
+                            if (!oldIsMpv && oldPids.Count > 0) AudioCtl($"set {oldCsv} {targetVol} {oldMuteI}");
+                            var coverUntil = DateTime.UtcNow.AddMilliseconds(hasOld ? coverMs : 0);
+                            do
+                            {
+                                newScenePids = NewPids();
+                                if (newScenePids.Count > 0) AudioCtl($"set {PidCsv(newScenePids)} 0 1"); // muted, 0
+                                if (DateTime.UtcNow >= coverUntil && newScenePids.Count >= 1) break;
+                                await Task.Delay(50, cts.Token);
+                            } while (DateTime.UtcNow < coverUntil || newScenePids.Count < 1);
+                            string newCsv = PidCsv(newScenePids);
+                            TransitionService.TransLog($"scene xfade(lp-audio): new={newScenePids.Count} old={oldPids.Count} oldIsMpv={oldIsMpv} target={targetVol} muted={muted0} hasOld={hasOld} fadeMs={fadeMs}");
+
+                            // PHASE 2 — reveal: ramp new 0→target (unmuted) + old target→0. No fade on first.
+                            if (!hasOld) { AudioCtl($"set {newCsv} {targetVol} {oldMuteI}"); }
+                            else
+                            {
+                                int steps = Math.Clamp(fadeMs / 120, 5, 12);
+                                for (int s = 1; s <= steps && !cts.IsCancellationRequested; s++)
+                                {
+                                    double f = (double)s / steps;
+                                    int nv = (int)Math.Round(targetVol * f), ov = (int)Math.Round(targetVol * (1 - f));
+                                    if (newScenePids.Count > 0) AudioCtl($"set {newCsv} {nv} {oldMuteI}");
+                                    if (oldIsMpv) SendCommand("set_property", "volume", ov);
+                                    else if (oldPids.Count > 0) AudioCtl($"set {oldCsv} {ov} {oldMuteI}");
+                                    await Task.Delay(Math.Max(1, fadeMs / steps), cts.Token);
+                                }
+                                if (newScenePids.Count > 0) AudioCtl($"set {newCsv} {targetVol} {oldMuteI}");
+                                if (!oldIsMpv && oldPids.Count > 0) AudioCtl($"set {oldCsv} 0 {oldMuteI}");
+                            }
+                        }
+                        else
+                        {
+                            // No crossfade (transitions off / first wallpaper). No fade sets the level, and
+                            // stream-restore may have poisoned the launch volume → correct the new scene to
+                            // target via lp-audio (event-driven, survives the reap re-init) while we wait the
+                            // load delay before reaping the old.
+                            CorrectSceneVolume(oldPids, targetVol, muted0, 3000);
+                            await Task.Delay(SettingsService.Load().SceneTransitionDelayMs, cts.Token);
+                        }
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch { }
+                    // old faded to 0 → reap it (gated on the fade, not a fixed delay)
                     _prelaunchPidsToKill = null;
                     foreach (var proc in capturedMpv)
                         using (proc) { try { proc.Kill(entireProcessTree: true); } catch { } }
@@ -1054,47 +1244,114 @@ public static class PlayerHelper
                         try { if (File.Exists(sock)) File.Delete(sock); } catch { }
                     }
                     KillPids(capturedLwePids);
+
+                    // The reap re-inits the NEW stream → reset; lp-audio holds it (it keeps the group set,
+                    // applying on the 'change' event in ~1ms). Re-assert target, hold ~3s, then release so
+                    // normal volume control (ApplyLweVolume) governs steady state. (Crossfade only.)
+                    if (transitionActive && newScenePids.Count > 0)
+                    {
+                        AudioCtl($"set {PidCsv(newScenePids)} {targetVol} {oldMuteI}");
+                        try { await Task.Delay(3000, cts.Token); } catch { }
+                        AudioCtl("clear");
+                    }
                 });
             }
-            else // scene→video: launch mpvpaper first, kill LWE after AV: fires
+            else // scene→video (= S→V). transitions on → LIVE-COMPOSITE (reveal-a): the scene-A stays
+                 // LIVE underneath, the overlay decodes+composites B over it AND plays B's audio. So
+                 // mpvpaper-B must NOT be at BACKGROUND during the effect (it would cover the live A) —
+                 // it's launched LATE, under the overlay's opaque end-hold, then the old scene is reaped.
             {
                 var oldLwePids = ReadCurrentLwePids();
+                var oldPids = GetLweProcPids();   // outgoing scene's real process pids (stable across re-init)
                 KillMpvPaperOnly(); // safety: clear any stray mpvpaper + socket
 
                 var settings = SettingsService.Load();
-                var readyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                // Use fresh settings so volume/speed changes made while the previous
-                // video was playing carry over — _timedOptions is built at playlist
-                // start and is stale if the user adjusted global volume or speed.
-                var freshOpts = settings.BuildMpvOptions();
-                var launchOpts = BakeSpeedOverride(BakeVolumeOverride(freshOpts, path), path);
-                if (_isMuted && !launchOpts.Contains("--no-audio")) launchOpts += " --mute=yes";
-                _current = Launch(launchOpts, path, readyTcs);
-                OnWallpaperChanged?.Invoke(path);
-
-                var volOverride = ReadVolumeOverride(path);
-                var speedOverride = ReadSpeedOverride(path);
-                int vol = volOverride ?? settings.Volume;
-                double spd = speedOverride ?? settings.Speed;
-                // Sync-update the tick's speed factor under the caller's lock so the
-                // first ticks after launch don't scale interval by the previous video's speed.
-                // The Task.Run still pushes the value to mpv via IPC.
-                _currentSpeed = spd;
-                Task.Run(() => { SetVolume(vol); SetSpeed(spd); if (_isMuted) SendCommand("set_property", "mute", true); });
-
+                int targetVol = ReadVolumeOverride(path) ?? settings.Volume;
+                double spd = ReadSpeedOverride(path) ?? settings.Speed;
+                bool muted0 = _isMuted || AudioMonitor.IsMuted || settings.NoAudio;
+                int oldMuteI = muted0 ? 1 : 0;
+                int fadeMs = Math.Clamp(TransitionService.CurrentConfig().DurationMs, 200, 8000);
+                string oldCsv = PidCsv(oldPids);
                 var cts = _prelaunchCts = new CancellationTokenSource();
                 var capturedPids = oldLwePids;
+
+                // Launch mpvpaper-B at `vol`. `paused` → load it PAUSED at frame 0 (reveal-a): the renderer
+                // unpauses it (--mpv-unpause) at teardown so it hands off frame0→frame0 with the overlay-B
+                // (also paused at frame0) — NO seek, exactly like V→V (B never advances → nothing to repeat).
+                // Wires _current/speed/mute, returns its AV:-ready signal.
+                TaskCompletionSource<bool> LaunchVideoB(int vol, bool paused = false, double startSec = 0)
+                {
+                    var rt = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var lo = BakeNormalization(BakeSpeedOverride(BakeVolumeOverride(settings.BuildMpvOptions(), path), path), path);
+                    if (_isMuted && !lo.Contains("--no-audio")) lo += " --mute=yes";
+                    lo += $" --volume={vol}";
+                    if (paused && !lo.Contains("--pause")) lo += " --pause=yes";
+                    if (startSec > 0.2) lo += $" --start={startSec.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)}";  // pre-buffer near the handoff
+                    _current = Launch(lo, path, rt);
+                    _currentSpeed = spd;
+                    Task.Run(() => { SetSpeed(spd); if (_isMuted) SendCommand("set_property", "mute", true); });
+                    OnWallpaperChanged?.Invoke(path);
+                    return rt;
+                }
+
+                if (!transitionActive)
+                {
+                    // instant cut: launch B at target now, hold the old scene the load delay, then reap.
+                    LaunchVideoB(targetVol);
+                    _ = Task.Run(async () =>
+                    {
+                        try { await Task.Delay(settings.SceneTransitionDelayMs, cts.Token); } catch { return; }
+                        if (!cts.IsCancellationRequested) { KillPids(capturedPids); try { if (File.Exists(LwePidPath)) File.Delete(LwePidPath); } catch { } }
+                    });
+                    return;
+                }
+
                 _ = Task.Run(async () =>
                 {
-                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-                    linked.CancelAfter(3000); // fallback: kill LWE after 3s even without AV:
-                    try { await readyTcs.Task.WaitAsync(linked.Token); }
-                    catch (OperationCanceledException) { }
+                    // reveal-a: the overlay (already covering, spawned by TryStart) reveals B's frozen frame0
+                    // over the live scene-A. We fade the live scene-A OUT via lp-audio over the effect, then —
+                    // once the effect completes and the overlay holds opaque-B (--hold-end-ms) — launch
+                    // mpvpaper-B UNDER that cover PAUSED at frame0; the renderer unpauses it (--mpv-unpause)
+                    // at teardown → frame0→frame0 handoff with the overlay-B, no seek, no repeat.
+                    try
+                    {
+                        AudioCtl("clear");
+                        if (oldPids.Count > 0) AudioCtl($"set {oldCsv} {targetVol} {oldMuteI}");
+                        // Fade scene-A out over the effect PLUS the end-hold (≈ when B's audio starts at
+                        // teardown) so it tails out instead of going silent mid-hold; launch mpvpaper-B
+                        // PAUSED at frame0 the moment the EFFECT completes (overlay opaque → B hidden under
+                        // it), so it's decoded + ready when the renderer unpauses it at teardown.
+                        const int holdMs = 1300;                 // matches --hold-end-ms in TransitionService
+                        int totalMs = fadeMs + holdMs;
+                        // pre-buffer mpvpaper-B near the TEARDOWN position so the renderer's exact seek is
+                        // tiny/fast (≈ effect + hold − overlay warmup), wrapped for looping videos.
+                        double bDur = ProbeDurationSec(path);
+                        double preBuf = totalMs / 1000.0 - 0.3;
+                        if (bDur > 0.5) preBuf %= bDur;
+                        if (preBuf < 0) preBuf = 0;
+                        int steps = Math.Clamp(totalMs / 120, 6, 16);
+                        TaskCompletionSource<bool>? rt = null;
+                        for (int s = 1; s <= steps && !cts.IsCancellationRequested; s++)
+                        {
+                            double el = (double)s / steps * totalMs;
+                            double f = Math.Min(1.0, el / totalMs);
+                            if (oldPids.Count > 0) AudioCtl($"set {oldCsv} {(int)Math.Round(targetVol * (1 - f))} {oldMuteI}");
+                            if (rt == null && el >= fadeMs) rt = LaunchVideoB(targetVol, paused: true, startSec: preBuf);
+                            await Task.Delay(Math.Max(1, totalMs / steps), cts.Token);
+                        }
+                        if (oldPids.Count > 0) AudioCtl($"set {oldCsv} 0 {oldMuteI}");
+                        if (cts.IsCancellationRequested) return;
+                        rt ??= LaunchVideoB(targetVol, paused: true, startSec: preBuf);
+                        try { using var lk = CancellationTokenSource.CreateLinkedTokenSource(cts.Token); lk.CancelAfter(1500); await rt.Task.WaitAsync(lk.Token); } catch { }
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch { }
                     if (!cts.Token.IsCancellationRequested)
                     {
-                        KillPids(capturedPids);
+                        KillPids(capturedPids);   // reap the old scene; the overlay tears down → mpvpaper-B shows
                         try { if (File.Exists(LwePidPath)) File.Delete(LwePidPath); } catch { }
                     }
+                    AudioCtl("clear");
                 });
             }
             return;
@@ -1103,7 +1360,7 @@ public static class PlayerHelper
         // ── Video→video: existing seamless approach ───────────────────────────
         // _restartPending → force the cold-start branch (skip the seamless IPC swap) so THIS changeover
         // relaunches mpvpaper (the deferred leak-restart, masked by the natural switch). Then clear it.
-        bool mpvAlive = File.Exists(IpcSocket) && Process.GetProcessesByName("mpvpaper").Length > 0;
+        bool mpvAlive = File.Exists(IpcSocket) && MpvpaperProcs().Length > 0;
         // Compute the effective volume/speed BEFORE the switch so they can ride INTO `loadfile` as
         // per-file options. A post-loadfile `set_property volume` races mpv's own apply of the launch
         // default (--volume) and gets clobbered → the advanced-to item played at the global, not its
@@ -1111,7 +1368,7 @@ public static class PlayerHelper
         var cfg = SettingsService.Load();
         int effVol = ReadVolumeOverride(path) ?? cfg.Volume;
         double effSpd = ReadSpeedOverride(path) ?? cfg.Speed;
-        if (mpvAlive && !_restartPending && TryIpcSwitchToFile(path, effVol, effSpd, pauseAtStart: transitioning))
+        if (mpvAlive && !_restartPending && TryIpcSwitchToFile(path, effVol, effSpd, pauseAtStart: transitionPauseB))
         {
             _currentSpeed = effSpd; // keep the timed-tick speed factor in sync (cold path sets it below)
             OnWallpaperChanged?.Invoke(path);
@@ -1120,7 +1377,7 @@ public static class PlayerHelper
         else
         {
             KillCurrentProcess();
-            var opts = BakeSpeedOverride(BakeVolumeOverride(mpvOptions, path), path);
+            var opts = BakeNormalization(BakeSpeedOverride(BakeVolumeOverride(mpvOptions, path), path), path);
             if (_isMuted && !opts.Contains("--no-audio")) opts += " --mute=yes";
             _current = Launch(opts, path);
             // Keep tick speed factor in sync with the freshly launched video (mpv IPC path
@@ -1147,6 +1404,9 @@ public static class PlayerHelper
         // Transition handoff: load B paused at frame 0 (hidden under the opaque overlay); the
         // lp-transition renderer unpauses it (--mpv-unpause) the instant it tears down → seamless.
         if (pauseAtStart) fileOpts += ",pause=yes";
+        // Between-video loudness normalization for the incoming file (or "" to clear) — set the `af`
+        // before loadfile so the new file plays normalized; the volume in fileOpts stacks on top.
+        TrySendCommand("set", "af", NormalizeAf(path) ?? "");
         return TrySendCommand("set", "loop-file", loopFile ? "inf" : "no")
             && TrySendCommand("set", "loop-playlist", "no")
             && TrySendCommand("playlist-clear")
@@ -1640,6 +1900,19 @@ public static class PlayerHelper
         // Falls back to an immediate SwitchToFile for scene transitions or when IPC is unavailable.
         bool nextIsScene = IsScenePath(next);
         bool prevIsScene = !prevIsVideo && IsLweRunning;
+        TransitionService.TransLog($"DoVideoEndWait: next={System.IO.Path.GetFileName(next)} nextIsScene={nextIsScene} prevIsVideo={prevIsVideo} IsLweRunning={IsLweRunning} → prevIsScene={prevIsScene}");
+
+        // In advance-on-end mode PostSwitch re-arms us the instant the overlay fired the switch — but
+        // the IPC loadfile-B hasn't settled yet, so mpv still reports the OUTGOING file's near-end
+        // playtime-remaining. Reading that now computes sleepMs<=0 → we'd fire a spurious SECOND switch
+        // immediately (rapid A→B→A, landing on the wrong item). Wait for the transition's effect+teardown
+        // to finish (B actually playing) before sampling. (No-op when no overlay is in flight.)
+        while (TransitionService.InProgress && !ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(100, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+        if (ct.IsCancellationRequested) return;
 
         if (!nextIsScene && !prevIsScene)
         {
@@ -1654,6 +1927,57 @@ public static class PlayerHelper
                     catch (OperationCanceledException) { return; }
                     remaining = TryQueryTimeRemaining();
                 }
+            }
+            // transitions ON → fire the full-live overlay V→V transition, leading by the transition
+            // wall-time (effect + warmup) so it COMPLETES at the video's end: A plays to its end with no
+            // loop, then the seamless full-live handoff to mpvpaper-B — same effect as a manual /next,
+            // just timed to the video's end. (Transitions OFF keeps the mpv-internal gapless append below.)
+            var tcfgVV = TransitionService.CurrentConfig();
+            if (tcfgVV.Enabled)
+            {
+                if (remaining != null)
+                {
+                    try
+                    {
+                        while (true)
+                        {
+                            _speedChangeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            var rem2 = TryQueryTimeRemaining();
+                            if (rem2 == null) break;
+                            // Lead = effect duration + warmup estimate + slack. The lead is NOT the accuracy
+                            // mechanism — it only needs to fire EARLY: the renderer gates the effect start on
+                            // A's DECODED remaining (--align-a-end, requested below) and spends any early
+                            // slack at p=0 showing live A (invisible), so the effect completes at A's EOF to
+                            // within a frame regardless of warmup variance. Firing LATE is the only failure
+                            // (gate opens instantly; A holds its last frame briefly — never rewinds, it runs
+                            // loop-file=no), hence generous slack on top of the measured cover latency.
+                            int coverMs = Math.Clamp((TransitionService.LastCoverMs > 0 ? TransitionService.LastCoverMs : 1300) + 1200, 1500, 6000);
+                            // re-read the duration each iteration (not the arm-time capture) so a transition-
+                            // duration change during the possibly-minutes-long wait applies live to this lead
+                            int durNowMs = TransitionService.CurrentConfig().DurationMs;
+                            int leadMs = Math.Clamp(durNowMs, 200, 20000) + coverMs;
+                            var sleepMs = Math.Max(0, (int)(rem2.Value * 1000) - leadMs);
+                            if (sleepMs <= 0) break;
+                            var delayTask = Task.Delay(sleepMs, ct);
+                            var done = await Task.WhenAny(delayTask, _speedChangeTcs.Task).ConfigureAwait(false);
+                            if (ct.IsCancellationRequested) return;
+                            if (done == delayTask) { try { await delayTask; } catch (OperationCanceledException) { return; } break; }
+                            try { await Task.Delay(100, ct).ConfigureAwait(false); } catch (OperationCanceledException) { return; }
+                        }
+                    }
+                    finally { _speedChangeTcs = null; }
+                }
+                lock (_lock)
+                {
+                    if (!_waitingForVideoEnd || ct.IsCancellationRequested) return;
+                    _waitingForVideoEnd = false;
+                    _waitCts = null;
+                    // this switch is a video-END advance → the renderer must align p=1 to A's EOF
+                    TransitionService.RequestAlignAEnd();
+                    SwitchToFile(next, SettingsService.Load().BuildMpvOptions());
+                    PostSwitch(next);
+                }
+                return;
             }
             if (remaining != null)
             {
@@ -1756,7 +2080,15 @@ public static class PlayerHelper
                         _speedChangeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                         var rem2 = TryQueryTimeRemaining();
                         if (rem2 == null) break; // video already ended, launch scene now
-                        var delayMs = SettingsService.Load().SceneTransitionDelayMs;
+                        // Lead by the FULL transition wall-time so it COMPLETES at the video's natural end
+                        // (the video plays to its end + the scene takes over exactly then → no loop mid-
+                        // transition). V→S transition = reveal-hold (SceneTransitionDelayMs) + effect duration;
+                        // when no transition is active, just the scene-load lead (SceneTransitionDelayMs).
+                        var sceneLoadMs = SettingsService.Load().SceneTransitionDelayMs;
+                        var tcfg = TransitionService.CurrentConfig();
+                        int delayMs = tcfg.Enabled
+                            ? sceneLoadMs + Math.Clamp(tcfg.DurationMs, 200, 8000)
+                            : sceneLoadMs;
                         var sleepMs = Math.Max(0, (int)(rem2.Value * 1000) - delayMs);
                         if (sleepMs <= 0) break;
                         var delayTask = Task.Delay(sleepMs, ct);
@@ -1991,9 +2323,22 @@ public static class PlayerHelper
                 _advanceOnVideoEnd = advanceOnVideoEnd;
             }
 
+            // Crossing into timed mode (interval 0→positive, e.g. pure advance-on-end → timed) needs the
+            // interval timer started — it wasn't running while interval was 0. (Positive→0 leaves the
+            // timer ticking harmlessly; the `_timedInterval > Zero` guard in Tick suppresses the advance.)
+            if (_timedPaths!.Count > 1 && intervalSeconds > 0 && _playlistTimer == null)
+                StartTimedTimer();
+
             SaveTimedState();
         }
     }
+
+    // Live-apply a rotation change (interval / wait-for-video-end / advance-on-end) to the RUNNING timed
+    // playlist with no replay — preserves the running shuffle + the proportional countdown. No-op when no
+    // timed session is active (UpdateTimedSettings early-returns). Wired from /settings (global rotation,
+    // when the session follows globals) + /playlist/state (per-playlist rotation, when it overrides).
+    public static void ApplyRotationLive(int intervalSeconds, bool waitForVideoEnd, bool advanceOnVideoEnd)
+        => UpdateTimedSettings(_timedShuffle, intervalSeconds, waitForVideoEnd, advanceOnVideoEnd);
 
     public static void Stop()
     {
@@ -2004,6 +2349,9 @@ public static class PlayerHelper
             ClearPlaylistObserverPaths();
         }
         KillRestartDaemon();
+        // any in-flight transition died with its players — a stale InProgress marker would delay the
+        // NEXT session's first video-end sample (late transition on a short first clip)
+        TransitionService.ClearInProgress();
     }
 
     // Re-apply the last saved session: timed playlist, mpv-native playlist,
@@ -2112,6 +2460,14 @@ public static class PlayerHelper
 
     public static void TogglePause()
     {
+        // During a transition the visible/audible wallpaper IS the overlay (it decodes A/B itself;
+        // mpvpaper-B is parked at frame 0 for the handoff). Toggle the overlay's freeze instead of
+        // cycling mpvpaper — the renderer owns the pause state (stateless here → can't desync).
+        if (Process.GetProcessesByName("lp-transition").Length > 0)
+        {
+            SendOverlayCtl("pause");
+            return;
+        }
         lock (_lock)
         {
             SendCommand("cycle", "pause");
@@ -2155,6 +2511,7 @@ public static class PlayerHelper
         _isMuted = mute || _userMuted;
         if (!mute && _userMuted) return;
         SendCommand("set_property", "mute", _isMuted);
+        SendOverlayCtl(_isMuted ? "mute 1" : "mute 0");
         if (IsLweRunning) ApplyLweMute(_isMuted);
     }
 
@@ -2172,12 +2529,14 @@ public static class PlayerHelper
         }
         catch { }
         SendCommand("set_property", "mute", _isMuted);
+        SendOverlayCtl(_isMuted ? "mute 1" : "mute 0");
         if (IsLweRunning) ApplyLweMute(_isMuted);
     }
 
     public static void SetVolume(int volume)
     {
         SendCommand("set_property", "volume", (double)volume);
+        SendOverlayCtl($"vol {volume}");
         if (IsLweRunning) ApplyLweVolume(volume);
     }
 
@@ -2213,6 +2572,72 @@ public static class PlayerHelper
     {
         double panscan = scale == "fill" ? 1.0 : 0.0;
         SendCommand("set_property", "panscan", panscan);
+    }
+
+    // Apply CHANGED playback settings LIVE to the currently-playing wallpaper — no stop/replay/relaunch.
+    // Diffs prev→cur so we only poke mpv/LWE for what actually changed (needlessly re-applying vf/hwdec/
+    // cache re-inits the decoder → a visible stall). Volume/Speed/VideoScale/Normalization/AutoMute are
+    // applied by the /settings handler; this covers Loop, NoAudio, VideoFps, DisableCache, Demuxer*, HwDec
+    // (video, via mpv IPC properties) + NoAudio (scene, via LWE mute). All of these were formerly
+    // launch-only (needed a stop/replay to take effect).
+    public static void ApplyPlaybackSettingsLive(AppSettings prev, AppSettings cur, string? playingPath)
+    {
+        bool scene = IsLweRunning;
+        bool mpvAlive = File.Exists(IpcSocket) && MpvpaperProcs().Length > 0;
+
+        // NoAudio = mute the whole wallpaper's audio. Applies to a scene (LWE) OR a video (mpv).
+        if (prev.NoAudio != cur.NoAudio)
+        {
+            if (scene)
+            {
+                // Scenes launch with the audio device OPEN (primary at --volume 0 when NoAudio, never
+                // --silent) so this toggles LIVE. Hold the new mute/volume via lp-audio (event-driven →
+                // survives LWE's constant stream RE-CREATION, which resets a one-shot pactl — the whole
+                // reason lp-audio exists). Muting keeps the hold (persists until the next switch's
+                // AudioCtl("clear")); unmuting holds briefly then releases so steady-state / later volume
+                // changes aren't pinned. pactl too, as the lp-audio-absent fallback.
+                bool m = cur.NoAudio || _isMuted || AudioMonitor.IsMuted;
+                int vol = (playingPath != null ? ReadVolumeOverride(playingPath) : null) ?? cur.Volume;
+                var pids = GetLweProcPids();
+                if (pids.Count > 0)
+                {
+                    AudioCtl("clear");
+                    AudioCtl($"set {PidCsv(pids)} {vol} {(m ? 1 : 0)}");
+                    if (!m) Task.Run(async () => { await Task.Delay(700); AudioCtl("clear"); });
+                }
+                ApplyLweMute(m);
+                if (!m) ApplyLweVolume(vol);
+            }
+            else if (mpvAlive)
+            {
+                // mpv revives/kills the audio track live: `aid auto` re-inits the ao even after a
+                // --no-audio launch (verified). Off→on restores the effective volume + any active mute.
+                TrySendCommand("set", "aid", cur.NoAudio ? "no" : "auto");
+                if (!cur.NoAudio)
+                {
+                    SetVolume((playingPath != null ? ReadVolumeOverride(playingPath) : null) ?? cur.Volume);
+                    if (_isMuted || AudioMonitor.IsMuted) SendCommand("set_property", "mute", true);
+                }
+            }
+        }
+
+        if (!mpvAlive) return; // the rest are video-only mpv decode/buffer properties
+
+        // Loop: match the displayed video's loop-file. Only for a SINGLE (non-timed) video — the timed
+        // machinery owns loop-file (loadfile-append during advance-waits, per-item loop while displayed),
+        // so re-asserting it under a running playlist would break the advance / stop the clip early.
+        if (prev.Loop != cur.Loop && !_waitingForVideoEnd && !IsTimedPlaylistActive())
+            SetLoop(cur.Loop);
+        if (prev.VideoFps != cur.VideoFps)
+            TrySendCommand("set", "vf", cur.VideoFps > 0 ? $"fps={cur.VideoFps}" : "");
+        if (prev.DisableCache != cur.DisableCache)
+            TrySendCommand("set", "cache", cur.DisableCache ? "no" : "auto");
+        if (prev.DemuxerMaxBytes != cur.DemuxerMaxBytes)
+            TrySendCommand("set", "demuxer-max-bytes", $"{cur.DemuxerMaxBytes}MiB");
+        if (prev.DemuxerMaxBackBytes != cur.DemuxerMaxBackBytes)
+            TrySendCommand("set", "demuxer-max-back-bytes", $"{cur.DemuxerMaxBackBytes}MiB");
+        if (prev.HwDec != cur.HwDec)
+            TrySendCommand("set", "hwdec", string.IsNullOrWhiteSpace(cur.HwDec) ? "no" : cur.HwDec);
     }
 
     private static void StartPlaylistObserver(IReadOnlyList<string> videoPaths)
@@ -2301,6 +2726,19 @@ public static class PlayerHelper
     }
 
     // Returns the next wallpaper path, extending history if needed.
+    // The item the next timed advance WOULD pick, without advancing (for the video→scene lead). Within
+    // a cycle the order is fixed (shuffle reshuffles only at the cycle end), so the next is deterministic
+    // except at the shuffle wrap → null there (no early lead, falls back to the boundary advance).
+    private static string? PeekNextTimed()
+    {
+        if (_history != null && _historyIndex < _history.Count - 1) return _history[_historyIndex + 1];
+        var p = _timedPaths;
+        if (p == null || p.Count == 0) return null;
+        int ni = _timedIndex + 1;
+        if (ni < p.Count) return p[ni];
+        return _timedShuffle ? null : p[0];
+    }
+
     private static string? AdvanceToNext()
     {
         if (_history != null && _historyIndex < _history.Count - 1)
@@ -2379,19 +2817,55 @@ public static class PlayerHelper
                 }
             });
         }
+        ReapExcessMpvpaper(2); // cap orphaned/excess mpvpaper (see method) → never OOM the GPU
         return process;
+    }
+
+    // mpvpaper's process NAME varies by packaging — on NixOS it's ".mpvpaper-wrapped" (a nix
+    // wrapper), NOT "mpvpaper", so Process.GetProcessesByName("mpvpaper") returns EMPTY there →
+    // every kill / is-alive check silently no-ops → mpvpaper piles up → VRAM OOM → GPU crash storm.
+    // (This was THE leak on NixOS.) Match by SUBSTRING so wrapped names on any distro are caught.
+    private static Process[] MpvpaperProcs() =>
+        Process.GetProcesses()
+            .Where(p => { try { return p.ProcessName.Contains("mpvpaper"); } catch { return false; } })
+            .ToArray();
+
+    // Cap mpvpaper instances. mpvpaper has a frame-buffer VRAM leak and is spawned DETACHED
+    // (setsid, above) so instances OUTLIVE the backend — orphans from a dead/reloaded/crashed
+    // backend (or a transition reap-failure) accumulate → VRAM OOM → every GL/Vulkan app SIGSEGVs
+    // (the crash storm: kitty/dms/noctalia/clipboard). Keep the `keep` NEWEST (a full-live
+    // transition legitimately runs A+B = 2); kill the older excess. Runs at the single spawn
+    // chokepoint (Launch) → self-heals on every switch/restart, bounding mpvpaper at ≤keep.
+    private static void ReapExcessMpvpaper(int keep = 2)
+    {
+        try
+        {
+            var procs = MpvpaperProcs()
+                .OrderByDescending(p => { try { return p.StartTime; } catch { return DateTime.MinValue; } })
+                .ToList();
+            for (int i = 0; i < procs.Count; i++)
+                using (procs[i])
+                    if (i >= keep) { try { procs[i].Kill(entireProcessTree: true); } catch { } }
+        }
+        catch { }
     }
 
     private static void KillCurrentProcess()
     {
         StopPlaylistObserver();
-        foreach (var proc in Process.GetProcessesByName("mpvpaper"))
+        foreach (var proc in MpvpaperProcs())
         {
             using (proc)
             {
                 try { proc.Kill(entireProcessTree: true); } catch { }
             }
         }
+        // Kill any running transition overlay — it's a separate process (lp-transition) that decodes
+        // A/B itself, so without this a Stop/Apply during a transition leaves the effect playing.
+        // The video→video transition uses the IPC switch path (no KillCurrentProcess), so this never
+        // kills an in-progress transition's own overlay — only Stop / Apply / cold-launch / scene do.
+        foreach (var proc in Process.GetProcessesByName("lp-transition"))
+            using (proc) { try { proc.Kill(entireProcessTree: true); } catch { } }
         KillLweProcess();
         _current = null;
         var socketPath = IpcSocket;
@@ -2414,7 +2888,11 @@ public static class PlayerHelper
             }
         }
         catch { }
-        foreach (var proc in Process.GetProcessesByName("linux-wallpaperengine"))
+        // Same wrapped/truncated-name issue as mpvpaper: "linux-wallpaperengine" exceeds Linux's
+        // 15-char comm limit (and Nix wraps it) → GetProcessesByName exact-match returns EMPTY.
+        // Match by substring. (The PID-file path above is primary; this catches orphans.)
+        foreach (var proc in Process.GetProcesses()
+                     .Where(p => { try { return p.ProcessName.Contains("wallpaper"); } catch { return false; } }))
             try { proc.Kill(entireProcessTree: true); } catch { }
     }
 
@@ -2510,7 +2988,17 @@ public static class PlayerHelper
     // Spawns one linux-wallpaperengine process per monitor, writes new PIDs to
     // LwePidPath, and returns the new PID strings. Does NOT kill any existing
     // LWE processes — callers are responsible for killing old ones.
-    private static string[] SpawnLweProcesses(string workshopId, AppSettings settings)
+    // audioVolumePercent: the LWE --volume to launch at. A scene-transition launch passes 0 so LWE
+    // starts SILENT (no blast before the crossfade's pactl ramp can clamp the sink-input — LWE plays
+    // at its launch volume the instant its stream appears, ~0.5s before pactl can list/control it).
+    // Per-output cache path for LWE's own --screenshot dump (the scene's framebuffer, written at
+    // launch). The transition uses it for scene-A instead of grim → no compositor windows in the cover.
+    internal static string SceneShotPath(string output) => Path.Combine(
+        Environment.GetEnvironmentVariable("XDG_CACHE_HOME")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache"),
+        "livepaper", $"lpscene-{output.Replace('/', '_').Replace(' ', '_')}.png");
+
+    private static string[] SpawnLweProcesses(string workshopId, AppSettings settings, int audioVolumePercent = 100)
     {
         var pids = new List<string>();
         bool anyPrimary = settings.LweMonitors.Any(m => m.IsPrimary);
@@ -2530,12 +3018,16 @@ public static class PlayerHelper
             psi.ArgumentList.Add(monitor.Name);
 
             bool hasAudio = !anyPrimary || monitor.IsPrimary;
-            if (settings.NoAudio || !hasAudio)
-                psi.ArgumentList.Add("--silent");
+            if (!hasAudio)
+                psi.ArgumentList.Add("--silent"); // secondary monitors never carry scene audio (launch-only)
             else
             {
+                // Always OPEN the audio device on the primary — even when NoAudio — so NoAudio toggles
+                // LIVE (--silent would give no sink-input to unmute → a relaunch). NoAudio → launch at
+                // volume 0 (silent from frame 0, no lp-audio/pactl dependency); ApplyLweVolume brings it
+                // back with no relaunch.
                 psi.ArgumentList.Add("--volume");
-                psi.ArgumentList.Add("100");
+                psi.ArgumentList.Add((settings.NoAudio ? 0 : audioVolumePercent).ToString());
             }
 
             if (monitor.Fps > 0)
@@ -2544,6 +3036,16 @@ public static class PlayerHelper
                 psi.ArgumentList.Add(monitor.Fps.ToString());
             }
             psi.ArgumentList.Add("--no-fullscreen-pause");
+            // match the video VideoScale so scenes frame like videos (fill = cover, fit = letterbox)
+            psi.ArgumentList.Add("--scaling");
+            psi.ArgumentList.Add((settings.VideoScale ?? "fill").Equals("fit", StringComparison.OrdinalIgnoreCase) ? "fit" : "fill");
+            // self-dump a windowless frame (~0.5s after start) → the transition's scene-A cover uses it
+            // instead of grim (which composites whatever windows are open over the wallpaper).
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SceneShotPath(monitor.Name))!); } catch { }
+            psi.ArgumentList.Add("--screenshot");
+            psi.ArgumentList.Add(SceneShotPath(monitor.Name));
+            psi.ArgumentList.Add("--screenshot-delay");
+            psi.ArgumentList.Add("30");
             psi.ArgumentList.Add(workshopId);
 
             var proc = Process.Start(psi);
@@ -2562,10 +3064,35 @@ public static class PlayerHelper
         return [.. pids];
     }
 
+    // ffprobe a video's duration (seconds), 0 on failure — wraps the reveal-a pre-buffer seek for loops.
+    private static double ProbeDurationSec(string path)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("ffprobe")
+            {
+                ArgumentList = { "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path },
+                UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true,
+            };
+            using var p = Process.Start(psi)!;
+            var o = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit(2000);
+            return double.TryParse(o, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;
+        }
+        catch { return 0; }
+    }
+
     private static int LaunchScene(string workshopId, AppSettings settings)
     {
         KillLweProcess();
-        return SpawnLweProcesses(workshopId, settings).Length;
+        var before = GetLweProcPids();
+        int n = SpawnLweProcesses(workshopId, settings).Length;
+        // direct (non-transition) scene launch — hold the new scene at its target (muted when NoAudio /
+        // user / auto mute) via lp-audio, countering the stream-restore poison. NoAudio → target 0 (the
+        // device is open, just silent) so NoAudio can be toggled back on LIVE.
+        CorrectSceneVolume(before, settings.NoAudio ? 0 : settings.Volume,
+            settings.NoAudio || _isMuted || AudioMonitor.IsMuted, 3000);
+        return n;
     }
 
     private static string[] ReadCurrentLwePids()
@@ -2587,7 +3114,7 @@ public static class PlayerHelper
     // transitions where LWE is being kept alive until the new process is ready.
     private static void KillMpvPaperOnly()
     {
-        foreach (var proc in Process.GetProcessesByName("mpvpaper"))
+        foreach (var proc in MpvpaperProcs())
             using (proc) { try { proc.Kill(entireProcessTree: true); } catch { } }
         _current = null;
         var socketPath = IpcSocket;
@@ -2622,6 +3149,29 @@ public static class PlayerHelper
             }
         }
         return ids;
+    }
+
+    // Live LWE process PIDs straight from the process table (pgrep). Unlike the client→pid map this
+    // never transiently misses a process whose PA client is mid-(re)registration, so it's the reliable
+    // basis for the old-vs-new scene split in the crossfade (the client map can briefly drop a client).
+    private static HashSet<int> GetLweProcPids()
+    {
+        var set = new HashSet<int>();
+        try
+        {
+            var psi = new ProcessStartInfo("pgrep")
+            {
+                ArgumentList = { "-f", "linux-wallpaperengine" },
+                UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true,
+            };
+            using var proc = Process.Start(psi)!;
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit();
+            foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                if (int.TryParse(line.Trim(), out int p)) set.Add(p);
+        }
+        catch { }
+        return set;
     }
 
     private static List<int> GetLweSinkInputIds()
@@ -2731,5 +3281,33 @@ public static class PlayerHelper
             return options[..idx] + prefix + val + options[end..];
         }
         return options + $" {prefix}{val}";
+    }
+
+    // The loudnorm audio filter for an item's between-video normalization, or null when it shouldn't
+    // apply (normalization off / muted / scene / not yet measured). When enabled but unmeasured, kicks
+    // off a background measure so it's ready next time (never blocks the switch). Applied as an mpv `af`,
+    // so the per-item/global `volume` (which mpv applies AFTER the filter chain) stacks on top.
+    private static string? NormalizeAf(string path)
+    {
+        var s = SettingsService.Load();
+        if (!s.NormalizeAudio || s.NoAudio || IsScenePath(path)) return null;
+        var af = LibraryService.LoudnormAf(path, s.NormalizeTargetLufs);
+        if (af == null) { _ = LibraryService.EnsureLoudnessAsync(path); return null; } // measure for next time
+        return af;
+    }
+
+    // Append the normalization filter to a launch options string (mpvpaper -o "…"). last --af wins.
+    private static string BakeNormalization(string options, string path)
+    {
+        var af = NormalizeAf(path);
+        return af == null ? options : options + $" --af={af}";
+    }
+
+    // Live-apply normalization to the currently-playing video (toggle/retune takes effect without a
+    // switch). null/scene/no-socket → no-op. Unmeasured → clears the filter + kicks a background measure.
+    public static void ApplyNormalizationLive(string? path)
+    {
+        if (path == null || IsScenePath(path) || !File.Exists(IpcSocket)) return;
+        TrySendCommand("set", "af", NormalizeAf(path) ?? "");
     }
 }
