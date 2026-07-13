@@ -2889,10 +2889,12 @@ public static class PlayerHelper
         }
         catch { }
         // Same wrapped/truncated-name issue as mpvpaper: "linux-wallpaperengine" exceeds Linux's
-        // 15-char comm limit (and Nix wraps it) → GetProcessesByName exact-match returns EMPTY.
-        // Match by substring. (The PID-file path above is primary; this catches orphans.)
+        // 15-char comm limit (ProcessName = comm), so on Nix it truncates to ".linux-wallpape"
+        // (no trailing 'r') — GetProcessesByName / Contains("wallpaper") both MISS it. Match the
+        // truncation-safe substring "wallpape" (present in ".linux-wallpape" AND "linux-wallpaper";
+        // no false hit — livepaper/mpvpaper/hyprpaper lack it). PID-file path above is primary.
         foreach (var proc in Process.GetProcesses()
-                     .Where(p => { try { return p.ProcessName.Contains("wallpaper"); } catch { return false; } }))
+                     .Where(p => { try { return p.ProcessName.Contains("wallpape"); } catch { return false; } }))
             try { proc.Kill(entireProcessTree: true); } catch { }
     }
 

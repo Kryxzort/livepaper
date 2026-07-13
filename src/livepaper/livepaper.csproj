@@ -3,6 +3,11 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
+    <!-- .NET dlopens libicu at startup for CultureInfo; NixOS has no libicu at the expected path
+         → self-contained binary SIGABRTs in Program.Main (arg parsing) before anything runs, so
+         the GUI's spawned backend dies and no UI appears. Invariant globalization drops the ICU
+         dependency entirely (ordinal string ops) — fine for a wallpaper app. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
