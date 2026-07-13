@@ -2821,14 +2821,25 @@ public static class PlayerHelper
         return process;
     }
 
-    // mpvpaper's process NAME varies by packaging — on NixOS it's ".mpvpaper-wrapped" (a nix
-    // wrapper), NOT "mpvpaper", so Process.GetProcessesByName("mpvpaper") returns EMPTY there →
-    // every kill / is-alive check silently no-ops → mpvpaper piles up → VRAM OOM → GPU crash storm.
-    // (This was THE leak on NixOS.) Match by SUBSTRING so wrapped names on any distro are caught.
-    private static Process[] MpvpaperProcs() =>
-        Process.GetProcesses()
-            .Where(p => { try { return p.ProcessName.Contains("mpvpaper"); } catch { return false; } })
-            .ToArray();
+    // Match processes by their FULL /proc/<pid>/cmdline (the untruncated argv[0] path) — NOT the
+    // 15-char `comm`/ProcessName. Why: on NixOS the binary is wrapped (".mpvpaper-wrapped") so
+    // GetProcessesByName("mpvpaper") returns EMPTY → every kill silently no-ops → mpvpaper piles up
+    // → VRAM OOM → GPU crash storm (this was THE leak). cmdline carries the real "/usr/bin/mpvpaper"
+    // regardless of wrapper/truncation, and matching the full unique name avoids the generic false
+    // hits a short comm-substring would risk (e.g. "wallpaper" hitting unrelated apps).
+    private static Process[] ProcsByCmdline(string needle)
+    {
+        var hits = new List<Process>();
+        foreach (var p in Process.GetProcesses())
+        {
+            string cmd = "";
+            try { cmd = File.ReadAllText($"/proc/{p.Id}/cmdline"); } catch { }
+            if (cmd.Contains(needle)) hits.Add(p); else p.Dispose();
+        }
+        return hits.ToArray();
+    }
+
+    private static Process[] MpvpaperProcs() => ProcsByCmdline("mpvpaper");
 
     // Cap mpvpaper instances. mpvpaper has a frame-buffer VRAM leak and is spawned DETACHED
     // (setsid, above) so instances OUTLIVE the backend — orphans from a dead/reloaded/crashed
@@ -2888,13 +2899,10 @@ public static class PlayerHelper
             }
         }
         catch { }
-        // Same wrapped/truncated-name issue as mpvpaper: "linux-wallpaperengine" exceeds Linux's
-        // 15-char comm limit (ProcessName = comm), so on Nix it truncates to ".linux-wallpape"
-        // (no trailing 'r') — GetProcessesByName / Contains("wallpaper") both MISS it. Match the
-        // truncation-safe substring "wallpape" (present in ".linux-wallpape" AND "linux-wallpaper";
-        // no false hit — livepaper/mpvpaper/hyprpaper lack it). PID-file path above is primary.
-        foreach (var proc in Process.GetProcesses()
-                     .Where(p => { try { return p.ProcessName.Contains("wallpape"); } catch { return false; } }))
+        // Match the FULL cmdline "linux-wallpaperengine" (comm truncates to ".linux-wallpape" on
+        // Nix → exact-match + any short "wallpaper" substring would miss or falsely hit). PID-file
+        // path above is primary; this catches orphans precisely.
+        foreach (var proc in ProcsByCmdline("linux-wallpaperengine"))
             try { proc.Kill(entireProcessTree: true); } catch { }
     }
 
