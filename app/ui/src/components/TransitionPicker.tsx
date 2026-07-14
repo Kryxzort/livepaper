@@ -28,6 +28,7 @@ export function TransitionPicker({
   const [hovered, setHovered] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const libraryItems = useStore((s) => s.libraryItems);
+  const videoScale = useStore((s) => (s.settings?.videoScale as string) ?? "fill");
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -61,6 +62,7 @@ export function TransitionPicker({
       if (!canvasRef.current) return;
       if (preview.attach(canvasRef.current)) {
         preview.setSources(x, y);   // start the GL preview + video streams only once WebGL is up
+        preview.setScale(videoScale);
         preview.setDuration(value.transitionDurationMs);
         preview.start(); setReady(true);
       } else {
@@ -83,6 +85,7 @@ export function TransitionPicker({
     preview.setEffect(previewId, e?.uniforms ?? []);
   }, [previewId, ready, effects]);
   useEffect(() => { if (ready) preview.setDuration(value.transitionDurationMs); }, [value.transitionDurationMs, ready]);
+  useEffect(() => { if (ready) preview.setScale(videoScale); }, [videoScale, ready]);
 
   const toggle = (id: string) => {
     const next = new Set(sel); next.has(id) ? next.delete(id) : next.add(id);
@@ -161,7 +164,8 @@ export function TransitionPicker({
                       <div className="tr-chips">
                         {list.map((e) => (
                           <button key={e.id} className={`tr-chip${sel.has(e.id) ? " on" : ""}${previewId === e.id ? " hov" : ""}`}
-                            disabled={!en} onMouseEnter={() => setHovered(e.id)} onClick={() => toggle(e.id)}>{e.name}</button>
+                            disabled={!en} onMouseEnter={() => setHovered(e.id)} onClick={() => toggle(e.id)}>
+                            {e.reveal && <span className="tr-live" title="Plays live (incoming keeps playing) in Reveal method" />}{e.name}</button>
                         ))}
                       </div>
                     </div>

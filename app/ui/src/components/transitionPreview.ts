@@ -62,6 +62,7 @@ let target: HTMLCanvasElement | null = null, tctx: CanvasRenderingContext2D | nu
 let a: Side = {}, b: Side = {};
 let effectId = "", uniforms: { name: string; type: string; default: number[] | null }[] = [];
 let durMs = 600, raf = 0, t0 = 0;
+let fillMode = true; // matches "Video scale": fill = cover (crop), fit = contain (letterbox)
 
 // Resize the render buffer to the tallest source's NATIVE height (clamped 720–1080, kept 16:9).
 // The WebGL program/textures/VAO are not size-bound, so only the canvases + the visible target need
@@ -106,10 +107,11 @@ function upload(side: Side, tex: WebGLTexture | null) {
   const ih = useVid ? v!.videoHeight : (img!.naturalHeight || rh);
   gl.bindTexture(gl.TEXTURE_2D, tex);
   try {
-    // object-fit: cover — scale the frame to FILL the 16:9 buffer, center, crop the overflow (no stretch).
-    const scale = Math.max(rw / iw, rh / ih);
+    // Match "Video scale": fill = cover (scale to fill, center-crop overflow); fit = contain (scale to
+    // fit, center, black letterbox). Never stretch.
+    const scale = fillMode ? Math.max(rw / iw, rh / ih) : Math.min(rw / iw, rh / ih);
     const dw = iw * scale, dh = ih * scale;
-    sctx.clearRect(0, 0, rw, rh);
+    sctx.clearRect(0, 0, rw, rh); // black bars for contain
     sctx.drawImage(src, (rw - dw) / 2, (rh - dh) / 2, dw, dh);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, scratch);
   } catch { /* not decodable yet / tainted — skip this frame */ }
@@ -165,6 +167,7 @@ export const preview = {
     return true;
   },
   setSources(sa: Source, sb: Source) { disposeSources(); a = mk(sa); b = mk(sb); },
+  setScale(mode: string) { fillMode = mode !== "fit"; }, // "fill" (cover) | "fit" (letterbox)
   setEffect(id: string, u: { name: string; type: string; default: number[] | null }[]) {
     effectId = id; uniforms = u ?? [];
     if (!gl || programs.has(id)) return;

@@ -26,6 +26,18 @@ public class AppSettings
         get => _speed;
         set => _speed = Math.Clamp(value, 0.1, 4.0);
     }
+    // EBU R128 loudness normalization between videos: each clip is measured once (cached in the library
+    // index) and gain-matched to NormalizeTargetLufs at playback. Per-item/global Volume stacks ON TOP
+    // (applied after the loudnorm filter). Target in LUFS (dB-referenced loudness); -14 = streaming std.
+    public bool NormalizeAudio { get; set; } = false;
+    private double _normTarget = -14.0;
+    public double NormalizeTargetLufs
+    {
+        get => _normTarget;
+        // 0 (loudest) … -100 (near-silent). Even at 0, loudnorm's -1.5 dBTP limiter + volume capped at
+        // unity (≤100) mean the output can't clip — extremes just land very loud-but-limited or silent.
+        set => _normTarget = Math.Clamp(value, -100.0, 0.0);
+    }
     public string WallpaperEnginePath { get; set; } = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".local/share/Steam/steamapps/workshop/content/431960");
@@ -70,6 +82,14 @@ public class AppSettings
     public int GlobalTransitionDurationMs { get; set; } = 600;
     public int GlobalTransitionDurationMaxMs { get; set; } = 0;
     public bool GlobalTransitionShuffle { get; set; } = true;
+    // How transitions render (global, advanced): "reveal" = freeze A, reveal the LIVE wallpaper-B
+    // underneath (WE-style; warp effects fall back to frozen); "frozen" = both sides frozen stills
+    // (all effects, zero cost); "full-live" = overlay decodes A+B live (all effects, heavy on 4K).
+    public string TransitionMethod { get; set; } = "reveal";
+    // Full-live only: aim the outgoing (A) decoder this many ms relative to the live wallpaper at the
+    // cover, to cancel the per-machine settling drift (negative = aim slightly ahead). The renderer
+    // takes it in seconds via --lag-offset; ~-30ms suits this dev box, may differ per GPU/refresh.
+    public int TransitionLagOffsetMs { get; set; } = -30;
     public bool AutoAddLibraryToPlaylist { get; set; } = false;
     public bool AutoImportWallpaperEngine { get; set; } = false;
     public bool IsPlaylistCollapsed { get; set; } = false;

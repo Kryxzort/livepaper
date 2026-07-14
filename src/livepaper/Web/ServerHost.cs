@@ -81,6 +81,17 @@ public static class ServerHost
         // `--monitor` on startup so the AutoMute toggle can Start/Stop it live (`/settings`), then hand
         // back to a detached `--monitor` on shutdown so mute survives app close.
         AudioMonitor.KillDetachedMonitor();
+        // Same ownership handoff for the TIMED-PLAYLIST timer: `--serve` runs the timer IN-PROCESS, so it
+        // must KILL any detached `--timer-daemon` (e.g. one spawned at boot by `--restore`) — otherwise
+        // BOTH own mpvpaper and the daemon keeps cycling its own (stale) playlist over ours ("creep") —
+        // and CLAIM ownership (WriteGuiTimerPid) so SpawnTimerDaemon's IsGuiTimerAlive guard skips while we
+        // live. Handed back to a detached daemon on shutdown (below) so the playlist survives app close.
+        PlayerHelper.KillTimerDaemon();
+        PlayerHelper.WriteGuiTimerPid();
+        // ...and RESUME the tick in-process so the playlist the daemon was running keeps advancing on
+        // GUI-open instead of freezing (the other half of the take-over — mirrors AudioMonitor.Start
+        // below). ResumeTimedTimer preserves the countdown and does NOT relaunch the on-screen wallpaper.
+        if (PlayerHelper.IsTimedPlaylistActive()) PlayerHelper.ResumeTimedTimer();
         var startup = SettingsService.Load();
         if (startup.AutoMute)
             AudioMonitor.Start(startup.AutoMuteDelayMs, startup.AutoUnmuteDelayMs, startup.AutoMuteThresholdDb, startup.AutoMuteOnlyIfMprisActive);
@@ -89,6 +100,11 @@ public static class ServerHost
             var s = SettingsService.Load();
             AudioMonitor.Stop();
             if (s.AutoMute && PlayerHelper.IsPlaying) AudioMonitor.SpawnDetachedMonitor();
+            // Release timer ownership, then hand the timed playlist back to a detached `--timer-daemon`
+            // so it keeps cycling after the app closes (the Electron shell only kills the backend — it
+            // doesn't run `--restore`). Clear-first so SpawnTimerDaemon's IsGuiTimerAlive guard lets it spawn.
+            PlayerHelper.ClearGuiTimerPid();
+            if (PlayerHelper.IsTimedPlaylistActive()) PlayerHelper.SpawnTimerDaemon();
         });
 
         // WE auto-import on startup, off-thread so the API is up immediately;
@@ -98,6 +114,11 @@ public static class ServerHost
             try { Program.RunHeadlessAutoSync(); EventBus.Broadcast("library-synced", new { count = 0 }); }
             catch { }
         });
+
+        // While the app is open, measure any un-measured library audio in the background so loudness
+        // normalization is ready before clips play (only when the feature is on).
+        if (startup.NormalizeAudio)
+            _ = Task.Run(async () => { try { await LibraryService.BackfillLoudnessAsync(); } catch { } });
 
         app.WaitForShutdown();
     }
@@ -315,6 +336,28 @@ public static class ServerHost
             PlayerHelper.SetVolume((curPlaying != null ? LibraryService.ReadVolumeOverride(curPlaying) : null) ?? s.Volume);
             PlayerHelper.SetSpeed((curPlaying != null ? LibraryService.ReadSpeedOverride(curPlaying) : null) ?? s.Speed);
             PlayerHelper.SetVideoScale(s.VideoScale); // fill/fit applies live to the playing video (no relaunch)
+            // loudness normalization: apply live to the playing wallpaper (toggle/retune now), and when
+            // it's on, (re)start the background measurement backfill so all clips get measured while open.
+            PlayerHelper.ApplyNormalizationLive(curPlaying);
+            if (s.NormalizeAudio) _ = LibraryService.BackfillLoudnessAsync();
+            // live-apply the remaining playback settings to the playing wallpaper (Loop, NoAudio,
+            // VideoFps, DisableCache, Demuxer*, HwDec + scene mute) — formerly needed a stop/replay.
+            PlayerHelper.ApplyPlaybackSettingsLive(prev, s, curPlaying);
+            // restart-daemon interval/mode changed → re-arm the in-process leak-restart timer now
+            // (0 → off) instead of only on the next play.
+            if (prev.RestartIntervalSeconds != s.RestartIntervalSeconds || prev.RestartOnSwitchOnly != s.RestartOnSwitchOnly)
+                PlayerHelper.UpdateRestartTimer();
+            // rotation (interval / advance-on-end / wait-for-video-end) changed → live-update a RUNNING
+            // timed playlist that follows the GLOBAL settings (a playlist with its own override is
+            // updated by /playlist/state instead). No replay needed.
+            if (PlayerHelper.IsTimedPlaylistActive()
+                && (prev.GlobalIntervalSeconds != s.GlobalIntervalSeconds
+                    || prev.GlobalAdvanceOnVideoEnd != s.GlobalAdvanceOnVideoEnd
+                    || prev.GlobalWaitForVideoEnd != s.GlobalWaitForVideoEnd)
+                && !(PlaylistService.LoadCurrentState()?.Settings.OverrideGlobalSettings ?? false))
+            {
+                PlayerHelper.ApplyRotationLive(s.GlobalIntervalSeconds, s.GlobalWaitForVideoEnd, s.GlobalAdvanceOnVideoEnd);
+            }
             // React live only when an AutoMute field changed — Start (restarts) when enabled,
             // Stop (also unmutes) when disabled. Applies to the currently-playing wallpaper immediately.
             bool amChanged = prev.AutoMute != s.AutoMute
@@ -392,7 +435,35 @@ public static class ServerHost
 
         // ---- playlist ---------------------------------------------------------------------
         app.MapGet("/playlist/state", () => Results.Json(PlaylistService.LoadCurrentState()));
-        app.MapPost("/playlist/state", (CustomPlaylist p) => { PlaylistService.SaveCurrentState(p); return Results.Ok(); });
+        app.MapPost("/playlist/state", (CustomPlaylist p) =>
+        {
+            var prevP = PlaylistService.LoadCurrentState();
+            PlaylistService.SaveCurrentState(p);
+            // Live-apply a rotation change (interval / advance-on-end / wait, or the override toggle) to
+            // the RUNNING timed playlist — no replay. Diff the EFFECTIVE rotation vs the previously-saved
+            // state so a plain reorder/add (which also POSTs state) never resets the countdown. When the
+            // playlist follows globals, /settings owns the live-apply (this stays a no-op then).
+            if (PlayerHelper.IsTimedPlaylistActive())
+            {
+                // Order (Sequential↔Shuffle) or the strip contents (drag-reorder / add / remove) changed →
+                // reflect it on the RUNNING playlist live (keeps the current item playing + the countdown).
+                // Diffed so a rotation/transition-only save doesn't needlessly re-shuffle. Reorder FIRST so
+                // it rebuilds _timedPaths before the rotation re-chains the video-end wait.
+                bool orderChanged = (prevP?.Settings.Order ?? PlaylistOrder.Sequential) != p.Settings.Order;
+                bool listChanged = prevP == null || !prevP.VideoPaths.SequenceEqual(p.VideoPaths);
+                if ((orderChanged || listChanged) && p.VideoPaths.Count > 0)
+                    PlayerHelper.ReorderPlaylist(p.VideoPaths, true, p.Settings.Order == PlaylistOrder.Shuffle);
+
+                var g = SettingsService.Load();
+                (int iv, bool wait, bool adv) Eff(CustomPlaylist? c) =>
+                    (c?.Settings.OverrideGlobalSettings ?? false)
+                        ? (c!.Settings.IntervalSeconds, c.Settings.WaitForVideoEnd, c.Settings.AdvanceOnVideoEnd)
+                        : (g.GlobalIntervalSeconds, g.GlobalWaitForVideoEnd, g.GlobalAdvanceOnVideoEnd);
+                var now = Eff(p);
+                if (now != Eff(prevP)) PlayerHelper.ApplyRotationLive(now.iv, now.wait, now.adv);
+            }
+            return Results.Ok();
+        });
         app.MapGet("/playlist/names", () => Results.Json(PlaylistService.ListNames()));
         app.MapPost("/playlist/save", (SavePlaylistReq r) => { PlaylistService.Save(r.Name, r.Playlist); return Results.Ok(); });
         app.MapPost("/playlist/load", (NameReq r) => Results.Json(PlaylistService.Load(r.Name)));

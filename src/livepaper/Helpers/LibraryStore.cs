@@ -18,6 +18,13 @@ public sealed class LibMeta
     public string? WorkshopId { get; set; }
     public int? Volume { get; set; }          // null = use global
     public double? Speed { get; set; }        // null = use global
+    // EBU R128 loudness measured once (ffmpeg loudnorm pass 1) → normalizes loudness between videos.
+    // All four present = measured; absent = not analyzed. Target-independent (gain applied live).
+    public double? LoudnessI { get; set; }      // integrated loudness (LUFS)
+    public double? LoudnessTP { get; set; }     // true peak (dBTP)
+    public double? LoudnessLRA { get; set; }    // loudness range (LU)
+    public double? LoudnessThresh { get; set; } // measurement threshold
+    public bool? LoudnessSkip { get; set; }     // true = no audio track → nothing to normalize, don't retry
     public bool Crashed { get; set; }
     public bool Whitelist { get; set; }
     public string? Resolution { get; set; }

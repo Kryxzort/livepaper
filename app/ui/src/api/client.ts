@@ -93,6 +93,7 @@ export interface TransitionUniform { name: string; type: string; default: number
 export interface TransitionEffect {
   id: string; name: string; category: string; defaultOn: boolean;
   author: string; license: string; uniforms: TransitionUniform[] | null;
+  reveal?: boolean; // plays live (B keeps playing) in Reveal method; else frozen fallback there
 }
 export interface CustomPlaylist { videoPaths: string[]; settings: PlaylistSettings; name: string | null; }
 export interface Theme {

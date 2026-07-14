@@ -7,7 +7,7 @@ import {
 import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
-  ChevronRight, ChevronDown, Shuffle, SlidersHorizontal, Save, FolderOpen, Play, X,
+  ChevronRight, ChevronDown, SlidersHorizontal, Save, FolderOpen, Play, X,
 } from "lucide-react";
 import { useStore } from "../store";
 import { type LibraryItem } from "../api/client";
@@ -138,8 +138,6 @@ export function PlaylistStrip() {
           onClick={() => setSetting("isPlaylistCollapsed", !collapsed)}>{collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}</button>
         <span className="strip-label">PLAYLIST</span>
         <span className="strip-count">{playlist.length}</span>
-        <button className={`mini${ps.order === 1 ? " on" : ""}`} title="Shuffle"
-          onClick={() => setPS({ order: ps.order === 1 ? 0 : 1 })}><Shuffle size={15} /></button>
         <button className="mini ico" title="Playlist settings" onClick={() => setShowSettings(true)}><SlidersHorizontal size={15} /></button>
         <button className="mini ico" title="Save playlist" onClick={() => setShowSave(true)}><Save size={15} /></button>
         <button className="mini ico" title="Load playlist" onClick={() => setShowLoad(true)}><FolderOpen size={15} /></button>

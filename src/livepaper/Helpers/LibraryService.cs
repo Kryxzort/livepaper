@@ -46,6 +46,145 @@ public static class LibraryService
     public static void MarkCrashed(string mediaPath) =>
         LibraryStore.SetMeta(mediaPath, m => m.Crashed = true);
 
+    // ---------- loudness (EBU R128) measurement, cached in the index ----------
+    public readonly record struct Loudness(double I, double TP, double LRA, double Thresh);
+
+    // Cached measurement for an item, or null if not yet analyzed.
+    public static Loudness? ReadLoudness(string mediaPath)
+    {
+        var m = LibraryStore.GetMeta(mediaPath);
+        if (m?.LoudnessI is { } i && m.LoudnessTP is { } tp && m.LoudnessLRA is { } lra && m.LoudnessThresh is { } th)
+            return new Loudness(i, tp, lra, th);
+        return null;
+    }
+
+    // The loudnorm audio-filter string to gain-match a measured item to targetLufs (linear, true-peak
+    // limited at -1.5 dBTP). Null if the item isn't measured yet. Used by both mpvpaper (PlayerHelper)
+    // and the transition overlay (TransitionService → lp-transition --from-af/--to-af) so both level.
+    public static string? LoudnormAf(string mediaPath, double targetLufs)
+    {
+        var m = ReadLoudness(mediaPath);
+        if (m == null) return null;
+        var inv = System.Globalization.CultureInfo.InvariantCulture; var v = m.Value;
+        return "loudnorm=I=" + targetLufs.ToString(inv) + ":TP=-1.5:LRA=11" +
+               ":measured_I=" + v.I.ToString(inv) + ":measured_TP=" + v.TP.ToString(inv) +
+               ":measured_LRA=" + v.LRA.ToString(inv) + ":measured_thresh=" + v.Thresh.ToString(inv) + ":linear=true";
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _measuring = new();
+
+    // Measure once (if not cached) + store. Safe to fire-and-forget; de-dups concurrent calls per path.
+    // Silent wallpapers (no audio stream) are marked LoudnessSkip so they're not re-probed every time.
+    public static async System.Threading.Tasks.Task EnsureLoudnessAsync(string mediaPath)
+    {
+        var meta = LibraryStore.GetMeta(mediaPath);
+        if (ReadLoudness(mediaPath) != null || meta?.LoudnessSkip == true) return;
+        if (!_measuring.TryAdd(mediaPath, 0)) return; // already in flight
+        try
+        {
+            if (!await HasAudioAsync(mediaPath).ConfigureAwait(false))
+            {
+                LibraryStore.SetMeta(mediaPath, m => m.LoudnessSkip = true); // no audio → never retry
+                return;
+            }
+            var r = await MeasureLoudnessAsync(mediaPath).ConfigureAwait(false);
+            if (r is { } v)
+            {
+                if (!double.IsFinite(v.I)) // silent track (-inf) → nothing to normalize, don't retry
+                    LibraryStore.SetMeta(mediaPath, m => m.LoudnessSkip = true);
+                else
+                    LibraryStore.SetMeta(mediaPath, m =>
+                        { m.LoudnessI = v.I; m.LoudnessTP = v.TP; m.LoudnessLRA = v.LRA; m.LoudnessThresh = v.Thresh; });
+            }
+        }
+        finally { _measuring.TryRemove(mediaPath, out _); }
+    }
+
+    // Quick check for an audio stream (ffprobe). Assumes yes on any failure (don't wrongly skip).
+    private static async System.Threading.Tasks.Task<bool> HasAudioAsync(string path)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("ffprobe")
+            { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in new[] { "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path })
+                psi.ArgumentList.Add(a);
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return true;
+            string o = await p.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+            _ = p.StandardError.ReadToEndAsync();
+            if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return true; }
+            return o.Contains("audio");
+        }
+        catch { return true; }
+    }
+
+    // ffmpeg loudnorm pass 1 → JSON on stderr; parse the input_* fields (the file's measured loudness).
+    public static async System.Threading.Tasks.Task<Loudness?> MeasureLoudnessAsync(string mediaPath)
+    {
+        if (!File.Exists(mediaPath)) return null;
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("ffmpeg")
+            {
+                UseShellExecute = false, RedirectStandardError = true, RedirectStandardOutput = true,
+            };
+            // -vn → don't decode video (loudness is audio-only). ~4× faster on 4K clips (the old path
+            // wastefully decoded full video frames just to measure the audio track).
+            foreach (var a in new[] { "-hide_banner", "-nostdin", "-vn", "-i", mediaPath,
+                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-" })
+                psi.ArgumentList.Add(a);
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return null;
+            string err = await p.StandardError.ReadToEndAsync().ConfigureAwait(false);
+            _ = p.StandardOutput.ReadToEndAsync();
+            if (!p.WaitForExit(120000)) { try { p.Kill(); } catch { } return null; }
+            // the JSON block is the last {...} in stderr
+            int s = err.LastIndexOf('{'), e = err.LastIndexOf('}');
+            if (s < 0 || e <= s) return null;
+            using var doc = JsonDocument.Parse(err.Substring(s, e - s + 1));
+            double G(string k)
+            {
+                var str = doc.RootElement.GetProperty(k).GetString()!;
+                if (str == "-inf") return double.NegativeInfinity; // silent audio track → loudnorm reports -inf
+                if (str == "inf") return double.PositiveInfinity;
+                return double.Parse(str, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            return new Loudness(G("input_i"), G("input_tp"), G("input_lra"), G("input_thresh"));
+        }
+        catch { return null; }
+    }
+
+    private static int _backfilling = 0;
+
+    // Measure every un-measured library video in the background — one ffmpeg at a time (gentle), so
+    // clips are ready before they play instead of being measured lazily on first play. Runs while the
+    // app is open when NormalizeAudio is on. Idempotent (skips measured) + single-flight; stops early if
+    // normalization is turned off mid-scan.
+    public static async System.Threading.Tasks.Task BackfillLoudnessAsync()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _backfilling, 1) == 1) return;
+        try
+        {
+            using var sem = new System.Threading.SemaphoreSlim(3); // 3 ffmpegs at once — fast, still gentle
+            var tasks = new List<System.Threading.Tasks.Task>();
+            foreach (var item in LoadAll())
+            {
+                if (!SettingsService.Load().NormalizeAudio) break;
+                if (item.IsScene || !IsVideoFile(item.VideoPath)) continue;
+                var meta = LibraryStore.GetMeta(item.VideoPath);
+                if (ReadLoudness(item.VideoPath) != null || meta?.LoudnessSkip == true) continue; // measured or no-audio
+                var path = item.VideoPath;
+                await sem.WaitAsync().ConfigureAwait(false);
+                tasks.Add(System.Threading.Tasks.Task.Run(async () =>
+                    { try { await EnsureLoudnessAsync(path).ConfigureAwait(false); } finally { sem.Release(); } }));
+            }
+            await System.Threading.Tasks.Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch { }
+        finally { System.Threading.Interlocked.Exchange(ref _backfilling, 0); }
+    }
+
     // ---------- LoadAll ----------
     public static List<LibraryItem> LoadAll()
     {

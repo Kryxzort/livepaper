@@ -481,6 +481,14 @@ body.modal-open .scroll .thumb.anim, body.modal-open .strip .thumb.anim { displa
 .sel-caret { opacity: .7; flex-shrink: 0; }
 .sel-val { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sel-backdrop { position: fixed; inset: 0; z-index: 90; }
+/* editable combobox: number field + attached preset-dropdown caret (see Combo.tsx) */
+.combo { display: inline-flex; align-items: stretch; }
+.combo .combo-in { width: 60px; border-top-right-radius: 0; border-bottom-right-radius: 0; border-right: none; }
+.combo-caret { display: inline-flex; align-items: center; justify-content: center; padding: 0 6px;
+  background: var(--surface1); border: 1px solid var(--surface2);
+  border-radius: 0 8px 8px 0; color: var(--text); cursor: pointer; opacity: .65;
+  transition: border-color .15s, box-shadow .2s, opacity .15s; }
+.combo-caret:hover { border-color: var(--accent); box-shadow: var(--glow-sm); opacity: 1; }
 .sel-pop { position: fixed; z-index: 91; max-height: 52vh; overflow: auto; display: flex; flex-direction: column; gap: 2px;
   background: color-mix(in srgb, var(--bg-mantle) var(--tr-strong), transparent); /* floating list = +0.1 (like the filter popover) */
   border: 1px solid var(--surface1); border-radius: 8px; padding: 4px;
@@ -619,4 +627,8 @@ body.modal-open .scroll .thumb.anim, body.modal-open .strip .thumb.anim { displa
 .tr-chip:hover:not(:disabled), .tr-chip.hov { border-color: var(--accent); color: var(--text); box-shadow: var(--glow-sm); }
 .tr-chip.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); box-shadow: var(--glow-sm); }
 .tr-chip:disabled { opacity: .5; cursor: default; }
+/* small dot = effect plays live (incoming keeps playing) in Reveal method */
+.tr-live { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%;
+  background: var(--success); box-shadow: 0 0 5px -1px var(--success); vertical-align: middle; }
+.tr-chip.on .tr-live { background: var(--accent-fg); box-shadow: none; }
 .tr-empty { text-align: center; color: var(--muted); padding: 30px; }

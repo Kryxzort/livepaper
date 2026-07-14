@@ -30,6 +30,15 @@ public static class AppOps
     public static string PlayPlaylist(List<string> paths, PlaylistSettings ps)
     {
         if (paths.Count == 0) return "Playlist is empty";
+        // Persist what's actually playing as the current playlist state. TransitionService.CurrentConfig()
+        // (the transition/crossfade gate) reads playlist_state.json — without this, /playlist/play only
+        // saved LastSession, so the state stayed stale and scene switches never transitioned/crossfaded.
+        try
+        {
+            var existing = PlaylistService.LoadCurrentState();
+            PlaylistService.SaveCurrentState(new CustomPlaylist { VideoPaths = paths, Settings = ps, Name = existing?.Name ?? "" });
+        }
+        catch { }
         var s = SettingsService.Load();
         bool shuffle = ps.Order == PlaylistOrder.Shuffle;
         int interval = EffInterval(s, ps);
