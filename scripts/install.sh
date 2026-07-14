@@ -33,10 +33,22 @@ else
   echo "    WARN: missing wayland-scanner/cc/EGL dev libs — skipping lp-transition (transitions no-op)"
 fi
 
+echo "==> building lp-audio (libpulse scene-audio crossfade helper)"
+# Optional: needs cc + libpulse dev. Absent → scene transitions just don't audio-crossfade (plain switch).
+if command -v cc >/dev/null 2>&1 && pkg-config --exists libpulse 2>/dev/null; then
+  make -C "$ROOT/src/native/lp-audio" >/dev/null && cp "$ROOT/src/native/lp-audio/lp-audio" "$LIB/lp-audio" \
+    && echo "    lp-audio built" || echo "    WARN: lp-audio build failed — scene audio won't crossfade"
+else
+  echo "    WARN: missing cc/libpulse — skipping lp-audio (scene audio won't crossfade)"
+fi
+
 echo "==> ensuring Electron (shell)"
 (cd "$ROOT/app/shell" && npm install >/dev/null 2>&1 || true)
-ELECTRON="$ROOT/app/shell/node_modules/electron/dist/electron"
-[ -x "$ELECTRON" ] || { echo "ERROR: Electron missing in app/shell (npm install failed?). Aborting."; exit 1; }
+# Prefer a system Electron (NixOS: the bundled prebuilt can't load its libs — libatk etc. aren't
+# at FHS paths; a native electron_42 from nixpkgs works). Fall back to the bundled prebuilt on
+# distros where it runs. Keep the 42.x pin (older crash-loops the GPU on NVIDIA + kernel ≥6.12).
+ELECTRON="$(command -v electron 2>/dev/null || echo "$ROOT/app/shell/node_modules/electron/dist/electron")"
+[ -x "$ELECTRON" ] || { echo "ERROR: no Electron (system or bundled). Install electron or run npm install in app/shell."; exit 1; }
 
 mkdir -p "$BIN"
 echo "==> installing 'livepaper' (headless CLI: --restore/--action/daemons/--serve)"
@@ -45,6 +57,7 @@ cat > "$BIN/livepaper" <<WRAP
 export LP_UI_DIR="$LIB/ui"
 export LP_TRANSITIONS_DIR="$LIB/transitions"
 [ -x "$LIB/lp-transition" ] && export LP_TRANSITION_BIN="$LIB/lp-transition"
+[ -x "$LIB/lp-audio" ] && export LP_AUDIO_BIN="$LIB/lp-audio"
 # bare 'livepaper' opens the GUI; any flag (--restore/--action/--serve/daemons) runs the headless backend
 [ \$# -eq 0 ] && exec "$BIN/livepaper-ui"
 exec "$LIB/backend/livepaper" "\$@"
@@ -58,6 +71,7 @@ export LP_BACKEND="$LIB/backend/livepaper"
 export LP_UI_DIR="$LIB/ui"
 export LP_TRANSITIONS_DIR="$LIB/transitions"
 [ -x "$LIB/lp-transition" ] && export LP_TRANSITION_BIN="$LIB/lp-transition"
+[ -x "$LIB/lp-audio" ] && export LP_AUDIO_BIN="$LIB/lp-audio"
 exec "$ELECTRON" "$ROOT/app/shell"
 WRAP
 chmod 755 "$BIN/livepaper-ui"
