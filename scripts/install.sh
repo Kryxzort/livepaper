@@ -22,25 +22,39 @@ rm -rf "$LIB/ui"; mkdir -p "$LIB/ui"; cp -r "$ROOT/app/ui/dist/." "$LIB/ui/"
 echo "==> staging transition assets (shaders + manifest + preview frames)"
 rm -rf "$LIB/transitions"; mkdir -p "$LIB/transitions"; cp -r "$ROOT/transitions/." "$LIB/transitions/"
 
-echo "==> building lp-transition (wlr-layer-shell GL renderer)"
-# Optional: needs cc + wayland-scanner + wayland/EGL/GLES dev headers (same as mpvpaper). If the
-# toolchain is missing, transitions just no-op (instant cut) — the rest of the app is unaffected.
-if command -v wayland-scanner >/dev/null 2>&1 && command -v cc >/dev/null 2>&1 \
-   && pkg-config --exists wayland-client wayland-egl egl glesv2 mpv 2>/dev/null; then
-  make -C "$ROOT/src/native/lp-transition" >/dev/null && cp "$ROOT/src/native/lp-transition/lp-transition" "$LIB/lp-transition" \
-    && echo "    lp-transition built" || echo "    WARN: lp-transition build failed — transitions will no-op"
-else
-  echo "    WARN: missing wayland-scanner/cc/EGL dev libs — skipping lp-transition (transitions no-op)"
+# Native helpers are REQUIRED, not optional: lp-transition renders every wallpaper switch
+# (transitions are a core feature, never a no-op) and lp-audio gapless-crossfades scene audio.
+# Preflight the toolchain and fail loudly with a fix — never silently ship a degraded build.
+echo "==> checking native build toolchain (lp-transition + lp-audio)"
+missing=""
+command -v cc            >/dev/null 2>&1 || missing="$missing cc"
+command -v make          >/dev/null 2>&1 || missing="$missing make"
+command -v pkg-config    >/dev/null 2>&1 || missing="$missing pkg-config"
+command -v wayland-scanner >/dev/null 2>&1 || missing="$missing wayland-scanner"
+if command -v pkg-config >/dev/null 2>&1; then
+  for p in wayland-client wayland-egl egl glesv2 mpv libpulse; do
+    pkg-config --exists "$p" 2>/dev/null || missing="$missing ${p}(dev)"
+  done
+fi
+if [ -n "$missing" ]; then
+  cat >&2 <<MSG
+ERROR: missing native build dependencies:$missing
+  Transitions and scene-audio crossfade are core features, not optional — install these and re-run:
+    Arch:   sudo pacman -S base-devel wayland wayland-protocols libglvnd mpv libpulse
+    Debian: sudo apt install build-essential libwayland-bin libwayland-dev libegl-dev libgles-dev libmpv-dev libpulse-dev
+    Fedora: sudo dnf install gcc make wayland-devel mesa-libEGL-devel mesa-libGLES-devel mpv-libs-devel pulseaudio-libs-devel
+    NixOS:  use the flake instead — 'nix run github:kryxzort/livepaper-pro' (all deps handled)
+MSG
+  exit 1
 fi
 
+echo "==> building lp-transition (wlr-layer-shell GL renderer)"
+make -C "$ROOT/src/native/lp-transition" >/dev/null   # set -e aborts on failure
+cp "$ROOT/src/native/lp-transition/lp-transition" "$LIB/lp-transition"
+
 echo "==> building lp-audio (libpulse scene-audio crossfade helper)"
-# Optional: needs cc + libpulse dev. Absent → scene transitions just don't audio-crossfade (plain switch).
-if command -v cc >/dev/null 2>&1 && pkg-config --exists libpulse 2>/dev/null; then
-  make -C "$ROOT/src/native/lp-audio" >/dev/null && cp "$ROOT/src/native/lp-audio/lp-audio" "$LIB/lp-audio" \
-    && echo "    lp-audio built" || echo "    WARN: lp-audio build failed — scene audio won't crossfade"
-else
-  echo "    WARN: missing cc/libpulse — skipping lp-audio (scene audio won't crossfade)"
-fi
+make -C "$ROOT/src/native/lp-audio" >/dev/null
+cp "$ROOT/src/native/lp-audio/lp-audio" "$LIB/lp-audio"
 
 echo "==> ensuring Electron (shell)"
 (cd "$ROOT/app/shell" && npm install >/dev/null 2>&1 || true)

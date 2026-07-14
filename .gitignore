@@ -16,4 +16,6 @@ scripts/livepaper-git/
 src/native/lp-transition/lp-transition
 src/native/lp-transition/*-protocol.c
 src/native/lp-transition/*-protocol.h
+# lp-audio: built binary
+src/native/lp-audio/lp-audio
 scripts/gl-transitions/

@@ -14,6 +14,7 @@ The interface is an **Electron + React** app over a **headless C# backend** — 
 - `libpulse` (provides `pactl`/`parec` for Auto-Mute; satisfied by either `pulseaudio` or `pipewire-pulse` on Arch)
 - `wl-clipboard` (`wl-copy` keeps Settings-tab snippets on the clipboard after livepaper closes)
 - .NET 10 SDK **and** Node.js / npm (for building from source — the C# backend and the React UI respectively)
+- **Native build toolchain** (required — transitions and scene-audio crossfade are core features): `cc`, `make`, `wayland-scanner`, `pkg-config`, and dev headers for `wayland`, `egl`, `glesv2`, `mpv`, `libpulse`. `install.sh` hard-fails with a per-distro fix if any are missing. *(On NixOS the flake below handles all of this — no manual install.)*
 
 ### Optional
 
@@ -39,6 +40,32 @@ bash scripts/install.sh
 ```
 
 Builds the React UI, publishes the self-contained C# backend, and installs **`livepaper`** to `~/.local/bin` (bare = open the GUI; flags = CLI/daemons), plus **`livepaper-ui`** (explicit GUI launcher) and a desktop entry.
+
+> The install script assumes its runtime deps (`ffmpeg`, `mpvpaper`, Electron, …) resolve from your system in the usual FHS paths — true on Arch/Ubuntu/Fedora. **NixOS has no global lib paths**, so use the flake below instead; it carries every dependency with it.
+
+### NixOS (flake)
+
+Requires flakes (`nix.settings.experimental-features = [ "nix-command" "flakes" ];`). The flake builds the self-contained backend, the React UI, and wraps an Electron shell with `ffmpeg`/`mpvpaper`/`linux-wallpaperengine` baked onto its `PATH` — nothing to install by hand.
+
+```bash
+# try it (no install)
+nix run github:kryxzort/livepaper-pro
+
+# install (imperative)
+nix profile install github:kryxzort/livepaper-pro
+```
+
+**Declarative** — add the input and reference the package:
+
+```nix
+# flake.nix
+inputs.livepaper.url = "github:kryxzort/livepaper-pro";
+
+# then, in your system/home config
+environment.systemPackages = [ inputs.livepaper.packages.${pkgs.system}.default ];
+```
+
+All three pull the full dependency closure — the app never relies on system libraries, so none of the usual NixOS "missing libssl / libatk / libicu" walls apply.
 
 ## Usage
 

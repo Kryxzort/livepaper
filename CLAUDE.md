@@ -11,8 +11,9 @@
 - `ffmpeg` — thumbnail extraction (Import) + frozen-frame grabs + transition frame capture (→ raw RGBA)
 - `wl-clipboard` — `wl-copy` for keybind Copy buttons (renderer uses `navigator.clipboard`, falls back to `wl-copy`)
 - `linux-wallpaperengine` *(optional)* — WE **scene** support (Settings → "Allow scene support")
-- `grim` — captures the live scene frame for transitions
-- *(build-time, optional)* `cc` + `wayland-scanner` + wayland/EGL/GLES dev headers — build `lp-transition` (transition renderer); absent → transitions no-op (instant cut)
+- `grim` — *fallback* scene-frame capture for transitions (scene-A cover); the primary path is LWE's own `--screenshot` (windowless framebuffer dump per output)
+- *(build-time, REQUIRED)* `cc` + `make` + `wayland-scanner` + wayland/EGL/GLES + `mpv` dev headers — build `lp-transition` (transition renderer). Transitions animate every wallpaper switch and are a core feature, never a no-op — `install.sh` hard-fails if the toolchain is missing (the flake handles it automatically)
+- *(build-time, REQUIRED)* `cc` + `libpulse` dev — build `lp-audio` (event-driven scene-audio crossfade helper) so scene switches crossfade instead of hard-cutting audio
 
 ## Common Commands
 
@@ -57,6 +58,7 @@ src/livepaper/            # headless C# backend (CLI + daemons + --serve API). N
 │                         #   SettingsService, AudioMonitor, MonitorDetector, TransitionService, WorkshopDownloader, WorkshopUnsubQueue
 └── Web/                  # ServerHost (minimal-API endpoints), AppOps (orchestration), EventBus (WS), SteamOps
 src/native/lp-transition/ # C: wlr-layer-shell + EGL/GLES transition renderer (built by install.sh)
+src/native/lp-audio/      # C: libpulse helper — event-driven scene-audio crossfade (built by install.sh)
 transitions/             # shared GLSL effect catalog (glsl/ + manifest.json + wrap.* + preview/) — UI previews + the renderer
 app/
 ├── ui/                   # Vite + React 19 + TS + zustand + framer-motion (the renderer)
@@ -66,6 +68,11 @@ app/
 WE-style **transitions** animate every wallpaper switch (gl-transitions GLSL) — see `.claude/rules/player.md`. v1: video→video, **full-live** (both sides keep playing through the effect — libmpv decodes A+B in the renderer; frozen stills are the warmup/scene fallback).
 
 The Avalonia UI (`Views/`, `ViewModels/`, `App.axaml`) was **removed** in the Electron rewrite — don't reference it. `Web/` only wraps the unchanged scrapers/helpers/daemons; UI lives in `app/`. See `.claude/rules/web-backend.md` + `web-ui.md`.
+
+## Engineering Rules
+
+- **Features must compose.** Any feature must keep working alongside *every other* feature/mode it can co-occur with — fix the interaction, never ship a broken combo or "park"/disable one behind another. Only a demonstrable hard limit (physical/architectural) excuses an incompatibility, and then say so explicitly. After building something, enumerate the modes it touches and verify each combo. (Transitions, for example, must work across: pure-timed, advance-on-video-end, wait-for-video-end, manual next/prev, random, restore — all four switch combos V→V/V→S/S→V/S→S.)
+- **Settings apply live.** A settings/override change must take effect on the *currently-playing* wallpaper immediately — never require a stop / replay / relaunch to see it. Videos: mpv IPC (`SendCommand`/`set_property`) — `PlayerHelper.ApplyPlaybackSettingsLive` diffs prev→cur and pushes `Loop`/`NoAudio` (`aid` — `aid auto` re-inits the ao even after a `--no-audio` launch)/`VideoFps` (`vf`)/`DisableCache` (`cache`)/`Demuxer*`/`HwDec` live; Volume/Speed/VideoScale/Normalization/AutoMute wired separately in `/settings`. Scenes: `pactl` / `lp-audio` — Volume + `NoAudio` (mute) toggle live (scenes launch with the audio device OPEN — primary at `--volume 0` when NoAudio, **never `--silent`** — so mute is reversible; the live toggle holds via lp-audio to beat LWE's stream re-creation). Rotation (interval / advance-on-end / wait) live-updates a RUNNING timed playlist via `UpdateTimedSettings` (`ApplyRotationLive`) from `/settings` (global, when the session follows globals) + `/playlist/state` (per-playlist override, diffed vs prev so a reorder/add never resets the countdown). The `/settings` endpoint applies the *effective* (`override ?? global`) value so a global change never clobbers an active per-item override; `/library/volume|speed` save the override then `ApplyOverrideLive` retargets the live wallpaper, and `/preview` is the no-persist drag twin. When adding a setting, wire its live path too (or note explicitly why it's launch-only — the only genuine one is `LweMonitors` per-monitor fps/primary, which LWE can't reconfigure without a relaunch).
 
 ## Commit Style
 
