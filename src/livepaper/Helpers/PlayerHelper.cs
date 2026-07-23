@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 using livepaper.Models;
 
 namespace livepaper.Helpers;
@@ -539,6 +540,7 @@ public static class PlayerHelper
     public static void RunRestartDaemon()
     {
         _daemonMode = true;
+        InstallShutdownReaper();
         WriteRestartDaemonPid();
         try
         {
@@ -2407,6 +2409,7 @@ public static class PlayerHelper
     public static void RunTimerDaemon()
     {
         _daemonMode = true;
+        InstallShutdownReaper();
         var settings = SettingsService.Load();
         var session = settings.LastSession;
         if (session == null || session.Paths.Count == 0) return;
@@ -2840,6 +2843,31 @@ public static class PlayerHelper
     }
 
     private static Process[] MpvpaperProcs() => ProcsByCmdline("mpvpaper");
+
+    // Reap EVERY wallpaper-related process by cmdline scan — NOT just `_current` (which is null in a
+    // daemon process that never spawned mpvpaper). mpvpaper is detached (setsid) so scanning /proc is
+    // the only cross-process way to find it. Used by the shutdown reaper below.
+    private static void ReapAllWallpaperProcs()
+    {
+        foreach (var needle in new[] { "mpvpaper", "lp-transition", "lp-audio" })
+            foreach (var p in ProcsByCmdline(needle))
+                using (p) { try { p.Kill(entireProcessTree: true); } catch { } }
+    }
+
+    // Graceful shutdown reaper for the long-lived daemons (--monitor/--timer-daemon/--restart-daemon).
+    // Those receive SIGTERM ONLY on system shutdown / session-stop: GUI close kills just the --serve
+    // backend (the wallpaper must SURVIVE that), and the app tears its OWN daemons down with
+    // Process.Kill() = SIGKILL (no handler fires). So a SIGTERM/HUP reaching a daemon == the machine is
+    // going down → reap the whole wallpaper tree, so detached mpvpaper doesn't linger, hold /home busy,
+    // and stall shutdown ~90s (the recurring slow-shutdown bug).
+    private static PosixSignalRegistration? _sigTerm, _sigInt, _sigHup;
+    public static void InstallShutdownReaper()
+    {
+        void Reap(PosixSignalContext ctx) { ctx.Cancel = true; try { ReapAllWallpaperProcs(); } catch { } Environment.Exit(0); }
+        _sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, Reap);
+        _sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, Reap);
+        _sigHup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, Reap);
+    }
 
     // Cap mpvpaper instances. mpvpaper has a frame-buffer VRAM leak and is spawned DETACHED
     // (setsid, above) so instances OUTLIVE the backend — orphans from a dead/reloaded/crashed

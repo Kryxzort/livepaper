@@ -74,6 +74,7 @@ public static class AudioMonitor
     public static void RunDaemon()
     {
         WriteMonitorPid();
+        PlayerHelper.InstallShutdownReaper(); // SIGTERM on system-shutdown → reap mpvpaper (see method)
         var settings = SettingsService.Load();
         if (settings.AutoMute)
             Start(settings.AutoMuteDelayMs, settings.AutoUnmuteDelayMs, settings.AutoMuteThresholdDb, settings.AutoMuteOnlyIfMprisActive);
